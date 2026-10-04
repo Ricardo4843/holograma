@@ -2,6 +2,8 @@ package holograma.gui;
 
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -225,6 +227,11 @@ public class HologramApp extends Application {
 
 	private final Deque<LiveSample> liveHistory = new ArrayDeque<>();
 	private boolean liveNew; // ha llegado una postura nueva en este fotograma
+	// Programa de Python que lee la webcam (lo arranca el botón "En directo")
+	private static final Path SENDER_SCRIPT = Path.of("webcam", "run.ps1");
+	private static final Path SENDER_LOG = Path.of("webcam", "sender.log");
+	private Process sender;
+	private boolean launchSender = true; // false con --live (pruebas: los datos los manda otro)
 	private final CheckBox showCloud = new CheckBox("Holograma (nube de puntos)");
 	private final CheckBox showSkeleton = new CheckBox("Esqueleto (segmentos y nodos)");
 	private ToggleButton walkButton;
@@ -340,9 +347,12 @@ public class HologramApp extends Application {
 			exoBox.setSelected(true);
 		if (args.containsKey("ankle"))
 			ankleBox.setSelected(true);
-		// --live=1: arranca en directo (esperando a webcam/pose_sender.py)
-		if (args.containsKey("live"))
+		// --live=1: arranca en directo SIN lanzar la webcam (para pruebas en las
+		// que los datos los manda otro programa, por ejemplo pose_sender.py --image)
+		if (args.containsKey("live")) {
+			launchSender = false;
 			liveButton.setSelected(true);
+		}
 
 		String snapshot = args.get("snapshot");
 		if (snapshot != null)
@@ -641,14 +651,76 @@ public class HologramApp extends Application {
 			String text;
 			if (receiver.getError() != null)
 				text = receiver.getError();
+			else if (sender != null && !sender.isAlive() && (pose == null || now - pose.nanos() > 1_000_000_000L))
+				text = "El programa de la webcam se ha cerrado:\n" + lastLogLine();
 			else if (pose == null || now - pose.nanos() > 1_000_000_000L)
-				text = "Esperando datos en el puerto " + receiver.getPort()
-						+ ".\nLanza webcam/pose_sender.py (ver README).";
+				text = sender != null && sender.isAlive()
+						? "Arrancando la webcam... (la primera vez instala MediaPipe y tarda unos minutos; si sale su ventana, ponte delante de la cámara de cuerpo entero)"
+						: "Esperando datos en el puerto " + receiver.getPort() + ".";
 			else
 				text = String.format("Recibiendo: %.0f posturas/s%s", liveRate,
 						live.legsVisible() ? "" : "\n(no se ven las piernas: en reposo)");
 			liveLabel.setText(text);
 		}
+	}
+
+	/**
+	 * Lanza webcam/run.ps1 (que crea el entorno de Python si hace falta y
+	 * arranca pose_sender.py) como un PROCESO aparte: otro programa que corre
+	 * a la vez que este. Su salida va a webcam/sender.log, para poder mostrar
+	 * el error si falla.
+	 *
+	 * ProcessBuilder recibe el comando como una lista de palabras (sin
+	 * comillas ni espacios que interpretar). "-ExecutionPolicy Bypass" evita
+	 * que Windows bloquee el script .ps1 (por defecto no deja ejecutar scripts).
+	 */
+	private void startSender() {
+		if (sender != null && sender.isAlive())
+			return;
+		if (!SENDER_SCRIPT.toFile().exists()) {
+			liveLabel.setText("No encuentro " + SENDER_SCRIPT + " (hay que lanzar el holograma desde su carpeta)");
+			return;
+		}
+		try {
+			ProcessBuilder pb = new ProcessBuilder("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+					SENDER_SCRIPT.toString());
+			pb.redirectErrorStream(true); // errores y salida normal, juntos
+			pb.redirectOutput(SENDER_LOG.toFile());
+			sender = pb.start();
+		} catch (IOException e) {
+			liveLabel.setText("No se pudo lanzar la webcam: " + e.getMessage());
+		}
+	}
+
+	/**
+	 * Cierra el programa de la webcam. PowerShell lanza a su vez a Python
+	 * (un proceso "hijo"), así que hay que cerrar también a sus descendientes.
+	 */
+	private void stopSender() {
+		if (sender == null)
+			return;
+		sender.descendants().forEach(ProcessHandle::destroy);
+		sender.destroy();
+		sender = null;
+	}
+
+	/** Última línea con texto del log de la webcam (para mostrar el error). */
+	private static String lastLogLine() {
+		try {
+			List<String> lines = Files.readAllLines(SENDER_LOG);
+			for (int i = lines.size() - 1; i >= 0; i--)
+				if (!lines.get(i).isBlank())
+					return lines.get(i).trim();
+		} catch (IOException e) {
+			// sin log: no hay nada que mostrar
+		}
+		return "(mira webcam/sender.log)";
+	}
+
+	/** JavaFX lo llama al cerrar la ventana: que no se quede la webcam encendida. */
+	@Override
+	public void stop() {
+		stopSender();
 	}
 
 	/** Colorea el holograma y las esferas según el esfuerzo y rellena la tabla de pares. */
@@ -1064,10 +1136,13 @@ public class HologramApp extends Application {
 			liveHistory.clear();
 			lastLiveNanos = 0;
 			resetPeaks();
-			if (on)
-				liveLabel.setText("Conectando...");
-			else {
+			if (on) {
+				liveLabel.setText("Arrancando la webcam...");
+				if (launchSender)
+					startSender();
+			} else {
 				receiver.stop(); // deja libre el puerto
+				stopSender();
 				liveLabel.setText("");
 			}
 		});
