@@ -4,9 +4,13 @@ Etapa 3 de la ampliación del lab2 de ALED (Recursividad: cinemática directa de
 
 ![holograma](docs/holograma.png)
 
-| Caminando | Esqueleto dentro del holograma | Captura de movimiento real (.bvh) | Mapa de esfuerzo (corriendo) |
-|---|---|---|---|
-| ![caminando](docs/holograma-caminando.png) | ![esqueleto](docs/esqueleto.png) | ![mocap](docs/holograma-mocap.png) | ![esfuerzo](docs/holograma-esfuerzo.png) |
+| Caminando | Esqueleto dentro del holograma | Captura de movimiento real (.bvh) |
+|---|---|---|
+| ![caminando](docs/holograma-caminando.png) | ![esqueleto](docs/esqueleto.png) | ![mocap](docs/holograma-mocap.png) |
+
+| Mapa de esfuerzo (corriendo) | Exoesqueleto virtual |
+|---|---|
+| ![esfuerzo](docs/holograma-esfuerzo.png) | ![exo](docs/holograma-exo.png) |
 
 ## Las tres etapas
 
@@ -28,6 +32,7 @@ Controles:
 - **Captura de movimiento:** "Reproducir" mueve el holograma con una grabación real de una persona (`.bvh`). Al arrancar se carga `animaciones/caminar.bvh`. Con "Cargar .bvh..." se elige otra (correr, saltar, bailar, artes marciales o cualquier `.bvh` descargado), y el slider cambia la velocidad (a 0 se queda en pausa).
 - Se puede mostrar el holograma, el esqueleto o los dos.
 - **Mapa de esfuerzo:** calcula el par de cada articulación (dinámica inversa) y colorea el holograma de cian a amarillo a rojo según lo cerca que esté de su par máximo. En el panel sale una tabla con los N·m de cada articulación (derecha, izquierda y el pico desde que se empezó), la fuerza del suelo y la fuerza residual. La masa corporal se cambia con un slider.
+- **Exoesqueleto virtual:** motores en cadera, rodilla y/o tobillo que dan un porcentaje del par (con un par máximo y una masa por motor). Se dibujan por fuera de las piernas, en naranja cuando empujan y en verde cuando frenan. Su tabla da, por motor, el par y la potencia, los picos y las rpm, y debajo la masa del exo, la potencia media, la batería para 1 hora y cuánto par le quita a la persona.
 - Hay un slider para el número de puntos (de 10.000 a 300.000).
 
 ## Cómo funciona
@@ -50,6 +55,12 @@ Controles:
    - Para la física se usa la trayectoria real de la cadera, no la de "cinta de correr" del dibujo: sin los frenazos y acelerones de cada paso, la cadera salía con pares 2 veces mayores.
    - Resultado con `caminar.bvh` y 70 kg: tobillo ~115 N·m, rodilla ~90 y cadera ~130 de pico, y una fuerza del suelo de 1,3 veces el peso. Al correr, tobillo ~230 y 2,2 veces el peso. Son del orden de los valores publicados, pero orientativos: masas de una persona media, sin músculos (es el par neto) y con un par máximo por articulación aproximado.
 
+8. **El exoesqueleto virtual.** `Exoskeleton` es un controlador de **asistencia proporcional**: cada motor da `asistencia × par necesario` en flexión/extensión, recortado a su par máximo, y la persona hace el resto. `InverseDynamics` no sabe nada de motores: pregunta a través de la interfaz `Assistance`. El exo además **pesa**: motores y barras se suman como masas a los segmentos, así que la dinámica los tiene en cuenta. Con `caminar.bvh`, 70 kg y motores de 1,5 kg en cadera y rodilla (7,6 kg en total):
+   - Con los motores apagados, el exo solo pesa y sube el pico de la cadera de 129 a 145 N·m.
+   - Al 50% de asistencia le quita a la persona un 23% del par de cadera y rodilla, con unos 42 W mecánicos de media.
+   - La rodilla, al caminar, casi solo **frena** (42 J frenando frente a 12 J empujando): funciona como un amortiguador, y un motor con regeneración podría recargar la batería.
+   - Un motor en el tobillo ayuda al tobillo, pero sus 1,5 kg cuelgan lejos de la cadera y su pico vuelve a subir. Por eso los exos de verdad ponen los motores arriba y bajan la fuerza con cables.
+
 ### Rendimiento: de 5 a 60 FPS
 
 La primera versión recalculaba en Java cada punto en cada fotograma. Calcularlos costaba unos 4 ms, pero JavaFX tarda mucho en reprocesar una malla que cambia, y con 65.000 puntos iba a **5 FPS**.
@@ -67,10 +78,10 @@ Resultado medido caminando (`--fpstest=8`):
 ## Estructura
 
 - `src/holograma/kinematics/`: `Matrix4`, `Vec3`, `Segment`, `Node3D`, `ForwardKinematics3D` (recursiva + iterativa), `HumanSkeleton` (esqueleto construido a partir de las articulaciones)
-- `src/holograma/dynamics/`: `InverseDynamics` (pares articulares por Newton-Euler recursivo, fuerza del suelo y polígono de apoyo)
+- `src/holograma/dynamics/`: `InverseDynamics` (pares articulares por Newton-Euler recursivo, fuerza del suelo y polígono de apoyo), `Exoskeleton` (controlador, masas y estadísticas de los motores)
 - `src/holograma/mocap/`: `BvhMotion` (lector de `.bvh` y su cinemática directa), `Retargeter` (pasa el movimiento del esqueleto del `.bvh` al nuestro)
 - `src/holograma/body/`: `ObjMesh` (lector de .obj), `JsonParser` (JSON por descenso recursivo), `MakeHumanRig` (pesos y articulaciones), `PointCloud` (holograma)
-- `src/holograma/gui/HologramApp.java`: visor JavaFX. Tiene también un modo captura (`--snapshot=f.png [--walk=s] [--yaw=grados] [--show=cloud,skeleton] [--points=n] [--bvh=f.bvh --bvhtime=s] [--effort=1]`) y una prueba de rendimiento (`--fpstest=segundos [--nowalk=1] [--bvh=f.bvh]`).
+- `src/holograma/gui/HologramApp.java`: visor JavaFX (y `ExoView`, el dibujo del exo). Tiene también un modo captura (`--snapshot=f.png [--walk=s] [--yaw=grados] [--show=cloud,skeleton] [--points=n] [--bvh=f.bvh --bvhtime=s] [--effort=1] [--exo=1 [--ankle=1]]`) y una prueba de rendimiento (`--fpstest=segundos [--nowalk=1] [--bvh=f.bvh]`).
 - `modelo/`: el cuerpo exportado de MakeHuman (`cuerpo.obj`) y los pesos de la malla base (`default_weights.mhw`, CC0, de MakeHuman 1.3.0)
 - `animaciones/`: capturas de movimiento de la base de datos de CMU (caminar, correr, saltar, bailar, artes marciales)
 - `lib/`: JavaFX 23.0.2 (jars para Windows de Maven Central)
@@ -80,7 +91,7 @@ Para usar otro cuerpo: en MakeHuman, exportar como Wavefront obj en centímetros
 ## Ideas para seguir
 
 - Cinemática inversa: dar la posición de la mano o del pie y calcular los ángulos (CCD o jacobiano).
-- Exoesqueleto virtual: actuadores en rodilla y cadera que den parte del par que ya calcula `InverseDynamics`, y ver cuánto le quitan al cuerpo.
+- Controladores de exo más realistas: por fases de la marcha, o con el par limitado por la curva par-velocidad de un motor real.
 - Dinámica con músculos (no solo el par neto) o simulación directa: eso ya no es para JavaFX. Habría que pasar a OpenSim (tiene API Java) o a MuJoCo (Python).
 
 Para más animaciones: la [base de datos de CMU](http://mocap.cs.cmu.edu/) tiene más de 2.500 en `.bvh` (conversión de cgspeed; hay copias en GitHub, por ejemplo [una-dinosauria/cmu-mocap](https://github.com/una-dinosauria/cmu-mocap)), y también funcionan las de Mixamo y las del dataset de Bandai Namco.

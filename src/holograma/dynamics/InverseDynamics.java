@@ -116,12 +116,41 @@ public class InverseDynamics {
 	/**
 	 * Resultado para una articulación (la de arriba de cada segmento).
 	 *
-	 * @param torque módulo del par (N·m)
-	 * @param local  el par descompuesto en los ejes locales del segmento: X =
-	 *               flexión/extensión, Y = abducción/aducción (o lateral), Z =
-	 *               rotación sobre el propio hueso
+	 * @param torque    módulo del par total que necesita la articulación (N·m)
+	 * @param human     módulo del par que le queda a la persona después de la
+	 *                  ayuda del exoesqueleto (sin exo, igual que torque)
+	 * @param effort    human / par máximo de la articulación
+	 * @param local     el par total en los ejes locales del segmento: X =
+	 *                  flexión/extensión, Y = abducción/aducción (o lateral), Z
+	 *                  = rotación sobre el propio hueso
+	 * @param speed     velocidad angular de flexión/extensión de la
+	 *                  articulación (rad/s, eje X local): la del hijo menos la
+	 *                  del padre
+	 * @param power     potencia de la articulación (W) = par · velocidad
+	 *                  angular. Positiva: los músculos empujan a favor del
+	 *                  movimiento y GENERAN energía (subir un escalón). Negativa:
+	 *                  frenan el movimiento y la ABSORBEN (bajarlo).
+	 * @param exoTorque par que da el motor del exo (N·m, sobre el eje X; 0 si
+	 *                  no hay motor)
+	 * @param exoPower  potencia del motor (W) = exoTorque · speed
 	 */
-	public record Joint(Segment segment, String name, double torque, double effort, double[] local) {
+	public record Joint(Segment segment, String name, double torque, double human, double effort, double[] local,
+			double speed, double power, double exoTorque, double exoPower) {
+	}
+
+	/**
+	 * Quién decide cuánto ayuda el exoesqueleto (lo implementa Exoskeleton).
+	 * Es una INTERFAZ: InverseDynamics no sabe nada de motores, solo pregunta
+	 * "para esta articulación, que necesita este par de flexión, ¿cuánto pones
+	 * tú?". Así cualquier controlador nuevo vale sin tocar esta clase.
+	 */
+	public interface Assistance {
+		/**
+		 * @param s        segmento (su articulación de arriba)
+		 * @param flexion  par de flexión/extensión que necesita (N·m)
+		 * @return par que da el motor sobre el mismo eje (0 = sin motor)
+		 */
+		double torque(Segment s, double flexion);
 	}
 
 	/** Resultado completo de un cálculo. */
@@ -137,6 +166,9 @@ public class InverseDynamics {
 	private final double[][] heelLocal = new double[2][];
 	private final double soleHeight; // altura de la planta en reposo (cm)
 	private double bodyMass = 70; // kg
+	// Masas añadidas (el exoesqueleto): segmento -> {kg, posición como fracción de su longitud}
+	private final Map<Segment, List<double[]>> extraMass = new IdentityHashMap<>();
+	private Assistance assistance; // null = sin exoesqueleto
 
 	// ---- Datos del cálculo en curso (se rellenan en compute) ----
 	private Map<Segment, double[]> com, acc, omega, alpha; // en metros y segundos
@@ -190,6 +222,50 @@ public class InverseDynamics {
 
 	public double getBodyMass() {
 		return bodyMass;
+	}
+
+	/**
+	 * Añade una masa puntual pegada a un segmento (un motor, una barra del
+	 * exoesqueleto...), a una fracción de su longitud desde la articulación de
+	 * arriba. Cuenta en el peso y en las aceleraciones, pero no en la inercia
+	 * de giro (es pequeña comparada con la del cuerpo).
+	 */
+	public void addMass(Segment s, double kg, double fraction) {
+		extraMass.computeIfAbsent(s, k -> new ArrayList<>()).add(new double[] { kg, fraction });
+	}
+
+	public void clearExtraMass() {
+		extraMass.clear();
+	}
+
+	public void setAssistance(Assistance a) {
+		assistance = a;
+	}
+
+	/** Masa del trozo de cuerpo (sin lo añadido). */
+	private double bodyPartMass(Segment s) {
+		return table.get(s).mass() * bodyMass;
+	}
+
+	/** Masa total del segmento: cuerpo + lo añadido. */
+	private double mass(Segment s) {
+		double m = bodyPartMass(s);
+		for (double[] e : extraMass.getOrDefault(s, List.of()))
+			m += e[0];
+		return m;
+	}
+
+	/**
+	 * Centro de masas del conjunto (cuerpo + añadidos), como fracción de la
+	 * longitud: la media de las posiciones ponderada por las masas.
+	 */
+	private double comFraction(Segment s) {
+		double m = bodyPartMass(s), sum = m * table.get(s).com();
+		for (double[] e : extraMass.getOrDefault(s, List.of())) {
+			m += e[0];
+			sum += e[0] * e[1];
+		}
+		return m == 0 ? 0 : sum / m;
 	}
 
 	/**
@@ -247,12 +323,24 @@ public class InverseDynamics {
 			Params p = table.get(s);
 			if (p.joint() == null)
 				continue;
-			double torque = norm(moment.get(s));
-			double e = torque / p.maxTorque();
+			double[] m = moment.get(s);
+			Matrix4 rot = cur.get(s).rotationOnly();
+			double[] local = rot.rigidInverse().transformDirection(m);
+			// Velocidad angular de la articulación: la del segmento menos la de su
+			// padre (lo que gira uno respecto al otro), en ejes del segmento
+			double[] parentOmega = s.getParent() == null ? new double[3] : omega.get(s.getParent());
+			double[] speedLocal = rot.rigidInverse().transformDirection(sub(omega.get(s), parentOmega));
+			double power = dot(m, sub(omega.get(s), parentOmega));
+
+			// Ayuda del exo: un motor sobre el eje X (flexión/extensión). Lo que
+			// le queda a la persona es el par total menos el del motor.
+			double exo = assistance == null ? 0 : assistance.torque(s, local[0]);
+			double[] human = sub(m, scale(rot.axis(0), exo));
+			double e = norm(human) / p.maxTorque();
 			effort.put(s, e);
 			String side = s.getName().endsWith(" D") ? " D" : s.getName().endsWith(" I") ? " I" : "";
-			double[] local = cur.get(s).rotationOnly().rigidInverse().transformDirection(moment.get(s));
-			joints.add(new Joint(s, p.joint() + side, torque, e, local));
+			joints.add(new Joint(s, p.joint() + side, norm(m), norm(human), e, local, speedLocal[0], power, exo,
+					exo * speedLocal[0]));
 		}
 		// Las regiones sin articulación propia toman el color de la de al lado
 		for (Segment s : segments)
@@ -286,13 +374,12 @@ public class InverseDynamics {
 		for (Segment child : s.getChildren())
 			solve(child, frames);
 
-		Params p = table.get(s);
-		double m = p.mass() * bodyMass;
+		double m = mass(s);
 		double[] c = com.get(s);
 		double[] joint = position(frames.get(s));
 
 		double[] f = scale(sub(acc.get(s), GRAVITY), m);
-		double[] mc = eulerMoment(s, frames.get(s), m);
+		double[] mc = eulerMoment(s, frames.get(s));
 		for (Segment child : s.getChildren()) {
 			double[] fc = force.get(child);
 			f = add(f, fc);
@@ -317,7 +404,8 @@ public class InverseDynamics {
 	 * pasa el vector a ejes locales (R^T · v), se multiplica por la diagonal y
 	 * se vuelve al mundo (R · ...). Es decir, I_mundo = R · I_local · R^T.
 	 */
-	private double[] eulerMoment(Segment s, Matrix4 frame, double m) {
+	private double[] eulerMoment(Segment s, Matrix4 frame) {
+		double m = bodyPartMass(s); // la inercia es solo la del cuerpo (ver addMass)
 		if (m == 0)
 			return new double[3];
 		Params p = table.get(s);
@@ -375,10 +463,9 @@ public class InverseDynamics {
 		// 1) Fuerza y momento (respecto al origen) que necesita el cuerpo entero
 		double[] total = new double[3], needed = new double[3];
 		for (Segment s : segments) {
-			double m = table.get(s).mass() * bodyMass;
-			double[] f = scale(sub(acc.get(s), GRAVITY), m);
+			double[] f = scale(sub(acc.get(s), GRAVITY), mass(s));
 			total = add(total, f);
-			needed = add(needed, add(cross(com.get(s), f), eulerMoment(s, frames.get(s), m)));
+			needed = add(needed, add(cross(com.get(s), f), eulerMoment(s, frames.get(s))));
 		}
 
 		// Talón y punta de cada pie (en cm, como los frames)
@@ -547,7 +634,7 @@ public class InverseDynamics {
 
 	/** Centro de masas del segmento en metros, en la postura de esos frames. */
 	private double[] comOf(Segment s, Map<Segment, Matrix4> frames) {
-		double along = table.get(s).com() * s.getLength();
+		double along = comFraction(s) * s.getLength();
 		return scale(frames.get(s).transformPoint(new double[] { 0, 0, along }), CM);
 	}
 

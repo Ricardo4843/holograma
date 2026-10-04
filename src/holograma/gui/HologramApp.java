@@ -15,6 +15,7 @@ import javax.imageio.ImageIO;
 
 import holograma.body.MakeHumanRig;
 import holograma.body.PointCloud;
+import holograma.dynamics.Exoskeleton;
 import holograma.dynamics.InverseDynamics;
 import holograma.kinematics.ForwardKinematics3D;
 import holograma.kinematics.HumanSkeleton;
@@ -50,6 +51,7 @@ import javafx.scene.image.WritableImage;
 import javafx.scene.layout.Background;
 import javafx.scene.layout.BackgroundFill;
 import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.HBox;
 import javafx.scene.layout.Pane;
 import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
@@ -109,6 +111,10 @@ import javafx.util.Duration;
  * Con "Mapa de esfuerzo" se calculan los pares de las articulaciones
  * (dinámica inversa, paquete dynamics) y el holograma se colorea según lo
  * cerca que está cada articulación de su par máximo.
+ *
+ * Con "Exoesqueleto virtual" se le ponen motores en las piernas
+ * (Exoskeleton, dibujados por ExoView) que ayudan con parte de ese par, y se
+ * miden par, velocidad, potencia y batería de cada motor.
  */
 public class HologramApp extends Application {
 
@@ -174,6 +180,21 @@ public class HologramApp extends Application {
 	private PhongMaterial jointMat; // color normal de las esferas
 	private final Map<Segment, Sphere> jointSpheres = new IdentityHashMap<>();
 	private boolean colored; // si ahora mismo se ve el mapa de esfuerzo
+
+	// ---- Exoesqueleto virtual ----
+	private final Exoskeleton exo = new Exoskeleton();
+	private final ExoView exoView = new ExoView();
+	private final CheckBox exoBox = new CheckBox("Exoesqueleto virtual");
+	private final CheckBox hipBox = new CheckBox("Cadera"), kneeBox = new CheckBox("Rodilla"),
+			ankleBox = new CheckBox("Tobillo");
+	private final Slider assistSlider = new Slider(0, 100, 50);
+	private final Slider motorTorqueSlider = new Slider(10, 150, 60);
+	private final Slider motorMassSlider = new Slider(0, 4, 1.5);
+	private final Label exoLabel = new Label();
+	private double exoMass; // kg de todo el exo con la configuración actual
+	// Segundos de animación que han pasado en este fotograma (para la energía
+	// de los motores; 0 si está parado)
+	private double frameDt;
 	private final CheckBox showCloud = new CheckBox("Holograma (nube de puntos)");
 	private final CheckBox showSkeleton = new CheckBox("Esqueleto (segmentos y nodos)");
 	private ToggleButton walkButton;
@@ -207,7 +228,7 @@ public class HologramApp extends Application {
 		int pointCount = Integer.parseInt(args.getOrDefault("points", "60000"));
 
 		// Grupo "mundo": aquí van las coordenadas de la cinemática.
-		Group world = new Group(cloudGroup, skeletonGroup);
+		Group world = new Group(cloudGroup, skeletonGroup, exoView.getNode());
 		// La cinemática usa Z hacia arriba (convenio de robótica), pero JavaFX usa
 		// Y hacia ABAJO (convenio de pantallas: el píxel (0,0) está arriba a la
 		// izquierda). Un giro de 90º sobre X convierte uno en otro:
@@ -284,6 +305,11 @@ public class HologramApp extends Application {
 		// --effort=1: arranca con el mapa de esfuerzo activado
 		if (args.containsKey("effort"))
 			effortBox.setSelected(true);
+		// --exo=1: arranca con el exoesqueleto puesto (con --ankle=1, también en el tobillo)
+		if (args.containsKey("exo"))
+			exoBox.setSelected(true);
+		if (args.containsKey("ankle"))
+			ankleBox.setSelected(true);
 
 		String snapshot = args.get("snapshot");
 		if (snapshot != null)
@@ -375,16 +401,19 @@ public class HologramApp extends Application {
 	 * Mide el tiempo de cada fase con System.nanoTime(), como en el lab2.
 	 */
 	private void frame(long now) {
+		frameDt = 0;
 		if (lastFrame != 0 && walkButton.isSelected()) {
 			// Tiempo real transcurrido desde el fotograma anterior. Así la marcha
 			// va a la misma velocidad aunque el ordenador vaya a 30 o a 144 FPS.
-			walkTime += (now - lastFrame) / 1e9;
+			frameDt = (now - lastFrame) / 1e9;
+			walkTime += frameDt;
 			applyWalk(walkTime);
 			refreshSliders();
 			dirty = true;
 		}
 		if (lastFrame != 0 && playButton.isSelected() && mocap != null) {
-			animTime += (now - lastFrame) / 1e9 * speedSlider.getValue();
+			frameDt = (now - lastFrame) / 1e9 * speedSlider.getValue();
+			animTime += frameDt;
 			applyAnimation();
 			refreshSliders();
 			dirty = true;
@@ -436,16 +465,21 @@ public class HologramApp extends Application {
 				setAffine(bone, f.multiply(Matrix4.translation(0, 0, s.getLength() / 2))
 						.multiply(Matrix4.rotX(Math.PI / 2)));
 		}
-		// 5) Pares articulares (dinámica inversa) y mapa de esfuerzo
+		// 5) Pares articulares (dinámica inversa), mapa de esfuerzo y exoesqueleto
 		long t3 = System.nanoTime();
+		boolean needDynamics = effortBox.isSelected() || exoBox.isSelected();
+		InverseDynamics.Result result = needDynamics ? computeDynamics(frames) : null;
 		if (effortBox.isSelected())
-			showEffort(frames);
+			showEffort(result);
 		else if (colored)
 			clearEffort();
+		exoView.setVisible(exoBox.isSelected());
+		if (exoBox.isSelected())
+			showExo(frames, result);
 		long t4 = System.nanoTime();
 
 		String retarget = playButton.isSelected() ? String.format("Retargeting .bvh: %.1f µs%n", retargetNanos / 1e3) : "";
-		String dyn = effortBox.isSelected() ? String.format("Dinámica inversa: %.1f µs%n", (t4 - t3) / 1e3) : "";
+		String dyn = needDynamics ? String.format("Dinámica inversa: %.1f µs%n", (t4 - t3) / 1e3) : "";
 		statsLabel.setText(String.format("%sCinemática directa: %.1f µs%nSkinning: %.2f ms%n%sFPS: %.0f", retarget,
 				(t1 - t0) / 1e3, (t2 - t1) / 1e6, dyn, fps));
 	}
@@ -453,8 +487,8 @@ public class HologramApp extends Application {
 	// ================================================================ esfuerzo
 
 	/**
-	 * Calcula los pares con la dinámica inversa, colorea el holograma y las
-	 * esferas, y rellena la tabla del panel.
+	 * Calcula los pares con la dinámica inversa (y, si está activado, con el
+	 * exoesqueleto: sus masas y su ayuda).
 	 *
 	 * La dinámica necesita velocidades y aceleraciones, que salen de comparar
 	 * la postura actual con la de un poco antes y un poco después (diferencias
@@ -474,7 +508,7 @@ public class HologramApp extends Application {
 	 * Después de calcular las posturas vecinas hay que volver a poner la
 	 * actual, porque applyWalk y Retargeter.apply cambian los ángulos.
 	 */
-	private void showEffort(Map<Segment, Matrix4> frames) {
+	private InverseDynamics.Result computeDynamics(Map<Segment, Matrix4> frames) {
 		Map<Segment, Matrix4> prev = frames, cur = frames, next = frames;
 		double h = 1;
 		boolean standing = true;
@@ -503,8 +537,22 @@ public class HologramApp extends Application {
 		}
 
 		dynamics.setBodyMass(massSlider.getValue());
-		InverseDynamics.Result r = dynamics.compute(prev, cur, next, h, standing);
+		if (exoBox.isSelected()) {
+			exo.setJoints(hipBox.isSelected(), kneeBox.isSelected(), ankleBox.isSelected());
+			exo.setAssist(assistSlider.getValue() / 100);
+			exo.setMaxTorque(motorTorqueSlider.getValue());
+			exo.setMotorMass(motorMassSlider.getValue());
+			exoMass = exo.applyMasses(dynamics, segments);
+			dynamics.setAssistance(exo);
+		} else {
+			dynamics.clearExtraMass();
+			dynamics.setAssistance(null);
+		}
+		return dynamics.compute(prev, cur, next, h, standing);
+	}
 
+	/** Colorea el holograma y las esferas según el esfuerzo y rellena la tabla de pares. */
+	private void showEffort(InverseDynamics.Result r) {
 		// Colores: valor de cada segmento en el orden de MakeHumanRig.SEGMENTS
 		if (rig != null) {
 			double[] values = new double[MakeHumanRig.SEGMENTS.length];
@@ -528,8 +576,10 @@ public class HologramApp extends Application {
 			String row = name.endsWith(" D") || name.endsWith(" I") ? name.substring(0, name.length() - 2) : name;
 			if (row.equals("Cabeza"))
 				continue; // se ve en el color; en la tabla no aporta y ocupa sitio
-			rows.computeIfAbsent(row, x -> new double[] { Double.NaN, Double.NaN })[col] = j.torque();
-			peaks.merge(row, j.torque(), Math::max); // guarda el mayor de los dos
+			// j.human(): lo que hace la PERSONA (con exo, lo que le queda después
+			// de la ayuda de los motores)
+			rows.computeIfAbsent(row, x -> new double[] { Double.NaN, Double.NaN })[col] = j.human();
+			peaks.merge(row, j.human(), Math::max); // guarda el mayor de los dos
 		}
 		StringBuilder sb = new StringBuilder(String.format("%-9s%6s%6s%7s%n", "N·m", "D", "I", "pico"));
 		rows.forEach((row, v) -> sb.append(String.format("%-9s%6s%6s%7.0f%n", row, number(v[0]), number(v[1]), peaks.get(row))));
@@ -538,6 +588,35 @@ public class HologramApp extends Application {
 				r.support(), norm(r.groundForce()), norm(r.groundForce()) / weight, norm(r.residualForce()),
 				norm(r.residualMoment())));
 		effortLabel.setText(sb.toString());
+	}
+
+	/**
+	 * Coloca el dibujo del exo, apunta las estadísticas de los motores y
+	 * rellena su tabla: por motor, par y potencia ahora, picos de par y
+	 * potencia y la velocidad máxima (rpm) de la articulación. Debajo, el
+	 * resumen para dimensionar la batería.
+	 */
+	private void showExo(Map<Segment, Matrix4> frames, InverseDynamics.Result r) {
+		exoView.update(frames, byName, exo, r);
+		exo.record(r, frameDt);
+
+		StringBuilder sb = new StringBuilder(String.format("%-9s%5s%5s%6s%5s%5s%n", "Motor", "N·m", "W", "pico", "W", "rpm"));
+		for (InverseDynamics.Joint j : r.joints()) {
+			if (!exo.actuates(j.segment()))
+				continue;
+			Exoskeleton.Stats st = exo.getStats().get(j.name());
+			sb.append(String.format("%-9s%5.0f%5.0f%6.0f%5.0f%5.0f%n", j.name(), j.exoTorque(), j.exoPower(),
+					st.peakTorque, st.peakPower, st.peakRpm));
+		}
+		double mean = exo.meanPositivePower();
+		sb.append(String.format("%nMasa del exo: %.1f kg%n", exoMass));
+		if (exo.getTime() > 0)
+			sb.append(String.format("Potencia media: %.0f W (frenando %.0f W)%nBatería para 1 h: %.0f Wh%n"
+					+ "Par que le quita a la persona: %.0f%%%n", mean, exo.meanNegativePower(),
+					mean / Exoskeleton.EFFICIENCY, exo.reduction() * 100));
+		else
+			sb.append("(reproduce una animación para la\nbatería y el esfuerzo quitado)");
+		exoLabel.setText(sb.toString());
 	}
 
 	private static String number(double v) {
@@ -593,6 +672,7 @@ public class HologramApp extends Application {
 	/** Borra los picos de la tabla (empiezan a contar otra vez). */
 	private void resetPeaks() {
 		peaks.clear();
+		exo.resetStats();
 	}
 
 	/**
@@ -931,6 +1011,29 @@ public class HologramApp extends Application {
 		// Letra de ancho fijo para que las columnas de la tabla salgan alineadas
 		effortLabel.setFont(Font.font("Consolas", 12));
 		Label legend = new Label("cian = poco, amarillo = medio,\nrojo = cerca del par máximo");
+
+		// Exoesqueleto: casillas de los motores y sliders. Cualquier cambio
+		// reinicia las estadísticas (si no, se mezclarían configuraciones).
+		hipBox.setSelected(true);
+		kneeBox.setSelected(true);
+		HBox motors = new HBox(10, hipBox, kneeBox, ankleBox); // en fila
+		Label assistLabel = new Label(), torqueLabel = new Label(), motorMassLabel = new Label();
+		assistLabel.textProperty().bind(assistSlider.valueProperty().asString("Asistencia: %.0f%% del par"));
+		torqueLabel.textProperty().bind(motorTorqueSlider.valueProperty().asString("Par máximo por motor: %.0f N·m"));
+		motorMassLabel.textProperty().bind(motorMassSlider.valueProperty().asString("Masa por motor: %.1f kg"));
+		for (CheckBox c : new CheckBox[] { exoBox, hipBox, kneeBox, ankleBox })
+			c.selectedProperty().addListener((obs, old, on) -> {
+				resetPeaks();
+				dirty = true;
+			});
+		for (Slider sl : new Slider[] { assistSlider, motorTorqueSlider, motorMassSlider })
+			sl.valueProperty().addListener((obs, old, val) -> {
+				resetPeaks();
+				dirty = true;
+			});
+		exoLabel.setFont(Font.font("Consolas", 12));
+		Label exoLegend = new Label("motor naranja = empuja, verde = frena");
+		exoLegend.setStyle("-fx-font-size: 11; -fx-text-fill: #666;");
 		legend.setStyle("-fx-font-size: 11; -fx-text-fill: #666;");
 
 		box.getChildren().addAll(new Separator(), reset, walkButton, new Separator(),
@@ -938,6 +1041,8 @@ public class HologramApp extends Application {
 				new Separator(),
 				showCloud, showSkeleton, new Separator(),
 				effortBox, legend, massLabel, massSlider, effortLabel, new Separator(),
+				exoBox, exoLegend, motors, assistLabel, assistSlider, torqueLabel, motorTorqueSlider, motorMassLabel,
+				motorMassSlider, exoLabel, new Separator(),
 				new Label("Puntos del holograma"), pointSlider, cloudLabel, new Separator(), statsLabel);
 		box.setPadding(new Insets(14));
 		box.setPrefWidth(290);
@@ -982,7 +1087,7 @@ public class HologramApp extends Application {
 	 * Modo captura, para generar imágenes sin tocar el ratón:
 	 * --snapshot=fichero.png [--walk=segundos] [--yaw=grados]
 	 * [--show=cloud,skeleton] [--points=n] [--bvh=fichero --bvhtime=segundos]
-	 * [--effort=1].
+	 * [--effort=1] [--exo=1 [--ankle=1]].
 	 * Espera 2 s a que se dibuje la escena, la guarda en PNG y cierra.
 	 */
 	private void takeSnapshotAndExit(Scene scene, String file) {
