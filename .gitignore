@@ -1,1 +1,4 @@
 bin/
+webcam/.venv/
+webcam/models/
+__pycache__/

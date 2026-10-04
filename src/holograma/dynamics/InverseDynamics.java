@@ -67,7 +67,7 @@ public class InverseDynamics {
 
 	/** Gravedad en m/s², hacia abajo (eje Z del mundo hacia arriba). */
 	private static final double[] GRAVITY = { 0, 0, -9.81 };
-	/** Un punto del pie está apoyado si está a menos de esto del suelo (cm). */
+	/** Un punto del pie está apoyado si está a menos de esto del suelo (cm), por defecto. */
 	private static final double CONTACT = 3;
 	/** Media anchura del pie (m), para la zona de apoyo. */
 	private static final double FOOT_HALF_WIDTH = 0.045;
@@ -169,6 +169,7 @@ public class InverseDynamics {
 	// Masas añadidas (el exoesqueleto): segmento -> {kg, posición como fracción de su longitud}
 	private final Map<Segment, List<double[]>> extraMass = new IdentityHashMap<>();
 	private Assistance assistance; // null = sin exoesqueleto
+	private double contactCm = CONTACT; // ver setContactTolerance
 
 	// ---- Datos del cálculo en curso (se rellenan en compute) ----
 	private Map<Segment, double[]> com, acc, omega, alpha; // en metros y segundos
@@ -236,6 +237,16 @@ public class InverseDynamics {
 
 	public void clearExtraMass() {
 		extraMass.clear();
+	}
+
+	/**
+	 * Distancia al suelo (cm) por debajo de la cual un pie cuenta como
+	 * apoyado. Con la webcam conviene más margen: la profundidad que estima
+	 * MediaPipe con una sola cámara tiene errores de varios centímetros, y un
+	 * pie apoyado puede parecer levantado.
+	 */
+	public void setContactTolerance(double cm) {
+		contactCm = cm;
 	}
 
 	public void setAssistance(Assistance a) {
@@ -486,7 +497,7 @@ public class InverseDynamics {
 		for (int f = 0; f < 2; f++) {
 			List<double[]> pts = new ArrayList<>();
 			for (double[] pt : points[f])
-				if (pt[2] < ground + CONTACT)
+				if (pt[2] < ground + contactCm)
 					pts.add(new double[] { pt[0] * CM, pt[1] * CM });
 			contact.add(pts);
 			if (!pts.isEmpty())

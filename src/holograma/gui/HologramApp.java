@@ -3,7 +3,9 @@ package holograma.gui;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.IdentityHashMap;
@@ -23,6 +25,8 @@ import holograma.kinematics.Matrix4;
 import holograma.kinematics.Node3D;
 import holograma.kinematics.Segment;
 import holograma.mocap.BvhMotion;
+import holograma.mocap.LiveReceiver;
+import holograma.mocap.LiveRetargeter;
 import holograma.mocap.Retargeter;
 import javafx.animation.AnimationTimer;
 import javafx.animation.PauseTransition;
@@ -115,6 +119,10 @@ import javafx.util.Duration;
  * Con "Exoesqueleto virtual" se le ponen motores en las piernas
  * (Exoskeleton, dibujados por ExoView) que ayudan con parte de ese par, y se
  * miden par, velocidad, potencia y batería de cada motor.
+ *
+ * Con "En directo (webcam)" el holograma copia en tiempo real la postura que
+ * manda webcam/pose_sender.py (MediaPipe) por UDP (LiveReceiver y
+ * LiveRetargeter).
  */
 public class HologramApp extends Application {
 
@@ -195,6 +203,28 @@ public class HologramApp extends Application {
 	// Segundos de animación que han pasado en este fotograma (para la energía
 	// de los motores; 0 si está parado)
 	private double frameDt;
+
+	// ---- En directo (webcam) ----
+	private final LiveReceiver receiver = new LiveReceiver(LiveReceiver.DEFAULT_PORT);
+	private LiveRetargeter live;
+	private final ToggleButton liveButton = new ToggleButton("En directo (webcam)");
+	private final CheckBox mirrorBox = new CheckBox("Modo espejo");
+	private final Label liveLabel = new Label();
+	private long lastLiveSeq, lastLiveNanos, liveWindowStart;
+	private int liveCount; // posturas recibidas en la ventana de medio segundo actual
+	private double liveRate;
+	/**
+	 * Historial de las últimas posturas en directo (cuándo llegó cada una y su
+	 * cinemática), para la dinámica inversa: en directo no se conoce el futuro,
+	 * así que se calcula un poco en el pasado (ver computeDynamics). Es una
+	 * COLA: se añade por el final y se quita por el principio lo que tiene más
+	 * de un segundo.
+	 */
+	private record LiveSample(long nanos, Map<Segment, Matrix4> frames) {
+	}
+
+	private final Deque<LiveSample> liveHistory = new ArrayDeque<>();
+	private boolean liveNew; // ha llegado una postura nueva en este fotograma
 	private final CheckBox showCloud = new CheckBox("Holograma (nube de puntos)");
 	private final CheckBox showSkeleton = new CheckBox("Esqueleto (segmentos y nodos)");
 	private ToggleButton walkButton;
@@ -310,6 +340,9 @@ public class HologramApp extends Application {
 			exoBox.setSelected(true);
 		if (args.containsKey("ankle"))
 			ankleBox.setSelected(true);
+		// --live=1: arranca en directo (esperando a webcam/pose_sender.py)
+		if (args.containsKey("live"))
+			liveButton.setSelected(true);
 
 		String snapshot = args.get("snapshot");
 		if (snapshot != null)
@@ -355,6 +388,7 @@ public class HologramApp extends Application {
 			byName.put(s.getName(), s);
 		restInverse = computeRestInverse();
 		dynamics = new InverseDynamics(skeleton);
+		live = new LiveRetargeter(skeleton);
 
 		// Animación: la de --bvh=fichero o, si no, la de por defecto
 		String bvh = getParameters().getNamed().get("bvh");
@@ -418,6 +452,9 @@ public class HologramApp extends Application {
 			refreshSliders();
 			dirty = true;
 		}
+		liveNew = false;
+		if (liveButton.isSelected())
+			updateLive(now);
 		lastFrame = now;
 
 		// Fotogramas por segundo, medidos en ventanas de medio segundo
@@ -436,6 +473,11 @@ public class HologramApp extends Application {
 		long t0 = System.nanoTime();
 		Node3D tree = ForwardKinematics3D.computePositions(root, origin[0], origin[1], origin[2]);
 		Map<Segment, Matrix4> frames = ForwardKinematics3D.frames(tree);
+		if (liveNew) {
+			liveHistory.addLast(new LiveSample(now, frames));
+			while (now - liveHistory.peekFirst().nanos() > 1_000_000_000L)
+				liveHistory.removeFirst();
+		}
 		long t1 = System.nanoTime();
 
 		// 2) Matriz de skinning de cada hueso: S = Frame_actual * Frame_reposo^-1
@@ -527,6 +569,19 @@ public class HologramApp extends Application {
 			cur = framesAt(mocap.travelledOrigin(f));
 			h = k * dt;
 			standing = false; // con .bvh hay suelo de verdad: se puede estar en el aire
+		} else if (liveButton.isSelected() && liveHistory.size() >= 3) {
+			// En directo: la última postura y las que llegaron más o menos h y 2h
+			// antes. La dinámica sale para la del medio (con un retraso de h).
+			LiveSample last = liveHistory.peekLast();
+			LiveSample middle = closest(last.nanos() - (long) (DYNAMICS_STEP * 1e9));
+			LiveSample first = closest(last.nanos() - (long) (2 * DYNAMICS_STEP * 1e9));
+			double span = (last.nanos() - first.nanos()) / 1e9;
+			if (span > 0.02 && middle != first && middle != last) {
+				prev = first.frames();
+				cur = middle.frames();
+				next = last.frames();
+				h = span / 2;
+			}
 		} else if (walkButton.isSelected()) {
 			h = DYNAMICS_STEP;
 			applyWalk(walkTime - h);
@@ -537,6 +592,7 @@ public class HologramApp extends Application {
 		}
 
 		dynamics.setBodyMass(massSlider.getValue());
+		dynamics.setContactTolerance(liveButton.isSelected() ? 10 : 3);
 		if (exoBox.isSelected()) {
 			exo.setJoints(hipBox.isSelected(), kneeBox.isSelected(), ankleBox.isSelected());
 			exo.setAssist(assistSlider.getValue() / 100);
@@ -549,6 +605,50 @@ public class HologramApp extends Application {
 			dynamics.setAssistance(null);
 		}
 		return dynamics.compute(prev, cur, next, h, standing);
+	}
+
+	/** Postura del historial en directo que llegó más cerca del instante dado. */
+	private LiveSample closest(long nanos) {
+		LiveSample best = null;
+		for (LiveSample s : liveHistory)
+			if (best == null || Math.abs(s.nanos() - nanos) < Math.abs(best.nanos() - nanos))
+				best = s;
+		return best;
+	}
+
+	/**
+	 * Modo en directo: recoge la última postura del receptor (que escucha en
+	 * otro hilo), y si es nueva, mueve el esqueleto. Cada medio segundo
+	 * actualiza el texto de estado.
+	 */
+	private void updateLive(long now) {
+		receiver.start(); // no hace nada si ya estaba escuchando
+		LiveReceiver.Pose pose = receiver.latest();
+		if (pose != null && pose.seq() != lastLiveSeq) {
+			lastLiveSeq = pose.seq();
+			origin = live.apply(pose.landmarks());
+			frameDt = lastLiveNanos == 0 ? 0 : Math.min(0.2, (now - lastLiveNanos) / 1e9);
+			lastLiveNanos = now;
+			liveCount++;
+			liveNew = true;
+			refreshSliders();
+			dirty = true;
+		}
+		if (now - liveWindowStart > 500_000_000L) {
+			liveRate = liveCount * 1e9 / (now - liveWindowStart);
+			liveCount = 0;
+			liveWindowStart = now;
+			String text;
+			if (receiver.getError() != null)
+				text = receiver.getError();
+			else if (pose == null || now - pose.nanos() > 1_000_000_000L)
+				text = "Esperando datos en el puerto " + receiver.getPort()
+						+ ".\nLanza webcam/pose_sender.py (ver README).";
+			else
+				text = String.format("Recibiendo: %.0f posturas/s%s", liveRate,
+						live.legsVisible() ? "" : "\n(no se ven las piernas: en reposo)");
+			liveLabel.setText(text);
+		}
 	}
 
 	/** Colorea el holograma y las esferas según el esfuerzo y rellena la tabla de pares. */
@@ -945,7 +1045,8 @@ public class HologramApp extends Application {
 		ToggleGroup animations = new ToggleGroup();
 		walkButton.setToggleGroup(animations);
 		playButton.setToggleGroup(animations);
-		for (ToggleButton b : new ToggleButton[] { walkButton, playButton })
+		liveButton.setToggleGroup(animations);
+		for (ToggleButton b : new ToggleButton[] { walkButton, playButton, liveButton })
 			b.selectedProperty().addListener((obs, old, on) -> {
 				// Mientras se anima, los sliders solo muestran (no se pueden mover)
 				for (Slider s : axisSliders)
@@ -957,6 +1058,22 @@ public class HologramApp extends Application {
 					refreshSliders();
 				}
 			});
+
+		// En directo
+		liveButton.selectedProperty().addListener((obs, old, on) -> {
+			liveHistory.clear();
+			lastLiveNanos = 0;
+			resetPeaks();
+			if (on)
+				liveLabel.setText("Conectando...");
+			else {
+				receiver.stop(); // deja libre el puerto
+				liveLabel.setText("");
+			}
+		});
+		mirrorBox.setSelected(true);
+		mirrorBox.selectedProperty().addListener((obs, old, on) -> live.setMirror(on));
+		liveLabel.setWrapText(true);
 
 		// Captura de movimiento (.bvh)
 		Button load = new Button("Cargar .bvh...");
@@ -1038,7 +1155,7 @@ public class HologramApp extends Application {
 
 		box.getChildren().addAll(new Separator(), reset, walkButton, new Separator(),
 				new Label("Captura de movimiento"), load, playButton, animLabel, speedLabel, speedSlider,
-				new Separator(),
+				new Separator(), liveButton, mirrorBox, liveLabel, new Separator(),
 				showCloud, showSkeleton, new Separator(),
 				effortBox, legend, massLabel, massSlider, effortLabel, new Separator(),
 				exoBox, exoLegend, motors, assistLabel, assistSlider, torqueLabel, motorTorqueSlider, motorMassLabel,
@@ -1068,7 +1185,8 @@ public class HologramApp extends Application {
 			sl.setMin(Math.toDegrees(s.getMin(i)));
 			sl.setMax(Math.toDegrees(s.getMax(i)));
 			sl.setValue(Math.toDegrees(s.getAngle(i)));
-			sl.setDisable(!free || walkButton != null && walkButton.isSelected() || playButton.isSelected());
+			sl.setDisable(!free || walkButton != null && walkButton.isSelected() || playButton.isSelected()
+					|| liveButton.isSelected());
 			updateAxisLabel(i, s);
 		}
 		updatingSliders = false;
@@ -1087,7 +1205,7 @@ public class HologramApp extends Application {
 	 * Modo captura, para generar imágenes sin tocar el ratón:
 	 * --snapshot=fichero.png [--walk=segundos] [--yaw=grados]
 	 * [--show=cloud,skeleton] [--points=n] [--bvh=fichero --bvhtime=segundos]
-	 * [--effort=1] [--exo=1 [--ankle=1]].
+	 * [--effort=1] [--exo=1 [--ankle=1]] [--live=1].
 	 * Espera 2 s a que se dibuje la escena, la guarda en PNG y cierra.
 	 */
 	private void takeSnapshotAndExit(Scene scene, String file) {

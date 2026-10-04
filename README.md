@@ -8,9 +8,9 @@ Etapa 3 de la ampliación del lab2 de ALED (Recursividad: cinemática directa de
 |---|---|---|
 | ![caminando](docs/holograma-caminando.png) | ![esqueleto](docs/esqueleto.png) | ![mocap](docs/holograma-mocap.png) |
 
-| Mapa de esfuerzo (corriendo) | Exoesqueleto virtual |
-|---|---|
-| ![esfuerzo](docs/holograma-esfuerzo.png) | ![exo](docs/holograma-exo.png) |
+| Mapa de esfuerzo (corriendo) | Exoesqueleto virtual | En directo con MediaPipe |
+|---|---|---|
+| ![esfuerzo](docs/holograma-esfuerzo.png) | ![exo](docs/holograma-exo.png) | ![webcam](docs/holograma-webcam.png) |
 
 ## Las tres etapas
 
@@ -25,11 +25,14 @@ Etapa 3 de la ampliación del lab2 de ALED (Recursividad: cinemática directa de
 - **Eclipse:** File > Import > General > Existing Projects into Workspace, y seleccionar esta carpeta. Run sobre `holograma.gui.HologramApp`. JavaFX 23 ya viene incluido en `lib/`. Hace falta un JDK 21 o superior.
 - **Terminal (PowerShell):** `.\run.ps1` compila y lanza el visor con `JAVA_HOME` o, si no está definido, con el JDK que trae Eclipse.
 
+**En directo con la webcam** (hace falta Python 3.9-3.12): en otra terminal, `.\webcam\run.ps1`. La primera vez crea `webcam/.venv` e instala MediaPipe. Después, en el holograma, pulsar "En directo (webcam)". También vale un vídeo grabado con el móvil (`.\webcam\run.ps1 --video fondo.mp4 --loop`) o una foto (`--image foto.jpg`).
+
 Controles:
 - Arrastrar el ratón para girar la cámara y la rueda para el zoom.
 - En el panel se elige una articulación y se mueve con los sliders.
 - Botones para caminar y para volver a la postura de reposo.
 - **Captura de movimiento:** "Reproducir" mueve el holograma con una grabación real de una persona (`.bvh`). Al arrancar se carga `animaciones/caminar.bvh`. Con "Cargar .bvh..." se elige otra (correr, saltar, bailar, artes marciales o cualquier `.bvh` descargado), y el slider cambia la velocidad (a 0 se queda en pausa).
+- **En directo (webcam):** el holograma copia la postura que manda `webcam/pose_sender.py`. En modo espejo, tu derecha mueve su izquierda, como en un espejo. Funciona con el mapa de esfuerzo y con el exo.
 - Se puede mostrar el holograma, el esqueleto o los dos.
 - **Mapa de esfuerzo:** calcula el par de cada articulación (dinámica inversa) y colorea el holograma de cian a amarillo a rojo según lo cerca que esté de su par máximo. En el panel sale una tabla con los N·m de cada articulación (derecha, izquierda y el pico desde que se empezó), la fuerza del suelo y la fuerza residual. La masa corporal se cambia con un slider.
 - **Exoesqueleto virtual:** motores en cadera, rodilla y/o tobillo que dan un porcentaje del par (con un par máximo y una masa por motor). Se dibujan por fuera de las piernas, en naranja cuando empujan y en verde cuando frenan. Su tabla da, por motor, el par y la potencia, los picos y las rpm, y debajo la masa del exo, la potencia media, la batería para 1 hora y cuánto par le quita a la persona.
@@ -61,6 +64,13 @@ Controles:
    - La rodilla, al caminar, casi solo **frena** (42 J frenando frente a 12 J empujando): funciona como un amortiguador, y un motor con regeneración podría recargar la batería.
    - Un motor en el tobillo ayuda al tobillo, pero sus 1,5 kg cuelgan lejos de la cadera y su pico vuelve a subir. Por eso los exos de verdad ponen los motores arriba y bajan la fuerza con cables.
 
+9. **En directo con la webcam.** Son dos programas que se hablan por la red local:
+   - `webcam/pose_sender.py` (Python): OpenCV lee la cámara (o un vídeo), MediaPipe Pose Landmarker (una red neuronal) encuentra 33 puntos del cuerpo en 3D, en metros, y los manda en JSON por **UDP** a `127.0.0.1:5005`. Se usa UDP y no TCP porque en vídeo en directo, si se pierde una postura, da igual: llega otra en 1/30 s.
+   - `LiveReceiver` (Java) escucha en un **hilo aparte**, porque `receive()` se queda bloqueado esperando y congelaría la ventana. Lee el JSON con el mismo `JsonParser` de los pesos de MakeHuman y deja la última postura en una `AtomicReference`, que es la forma segura de pasar un objeto de un hilo a otro.
+   - `LiveRetargeter` hace lo mismo que `Retargeter` (copiar direcciones y recorrer el árbol desde la pelvis), pero solo con posiciones: MediaPipe no da giros, así que lo que no se puede deducir (como la pronación del antebrazo) se queda neutro. Tiene un filtro exponencial contra el temblor (`s·anterior + (1−s)·nuevo`), y si no se ven las piernas (sentado delante del ordenador) se quedan en reposo. El suelo se pone en cada fotograma haciendo que el pie más bajo lo toque.
+   - Para la dinámica en directo no se conoce el futuro: se guarda una **cola** con las posturas del último segundo y se calcula para la de hace 0,08 s, con la anterior y la última.
+   - Con una sola cámara, la profundidad tiene errores de varios centímetros, así que en directo un pie cuenta como apoyado hasta a 10 cm del suelo (3 cm con las animaciones).
+
 ### Rendimiento: de 5 a 60 FPS
 
 La primera versión recalculaba en Java cada punto en cada fotograma. Calcularlos costaba unos 4 ms, pero JavaFX tarda mucho en reprocesar una malla que cambia, y con 65.000 puntos iba a **5 FPS**.
@@ -79,9 +89,10 @@ Resultado medido caminando (`--fpstest=8`):
 
 - `src/holograma/kinematics/`: `Matrix4`, `Vec3`, `Segment`, `Node3D`, `ForwardKinematics3D` (recursiva + iterativa), `HumanSkeleton` (esqueleto construido a partir de las articulaciones)
 - `src/holograma/dynamics/`: `InverseDynamics` (pares articulares por Newton-Euler recursivo, fuerza del suelo y polígono de apoyo), `Exoskeleton` (controlador, masas y estadísticas de los motores)
-- `src/holograma/mocap/`: `BvhMotion` (lector de `.bvh` y su cinemática directa), `Retargeter` (pasa el movimiento del esqueleto del `.bvh` al nuestro)
+- `src/holograma/mocap/`: `BvhMotion` (lector de `.bvh` y su cinemática directa), `Retargeter` (pasa el movimiento del esqueleto del `.bvh` al nuestro), `LiveReceiver` y `LiveRetargeter` (en directo desde MediaPipe)
+- `webcam/`: `pose_sender.py` (MediaPipe → UDP), `run.ps1` (crea el entorno y lo lanza) y `requirements.txt`
 - `src/holograma/body/`: `ObjMesh` (lector de .obj), `JsonParser` (JSON por descenso recursivo), `MakeHumanRig` (pesos y articulaciones), `PointCloud` (holograma)
-- `src/holograma/gui/HologramApp.java`: visor JavaFX (y `ExoView`, el dibujo del exo). Tiene también un modo captura (`--snapshot=f.png [--walk=s] [--yaw=grados] [--show=cloud,skeleton] [--points=n] [--bvh=f.bvh --bvhtime=s] [--effort=1] [--exo=1 [--ankle=1]]`) y una prueba de rendimiento (`--fpstest=segundos [--nowalk=1] [--bvh=f.bvh]`).
+- `src/holograma/gui/HologramApp.java`: visor JavaFX (y `ExoView`, el dibujo del exo). Tiene también un modo captura (`--snapshot=f.png [--walk=s] [--yaw=grados] [--show=cloud,skeleton] [--points=n] [--bvh=f.bvh --bvhtime=s] [--effort=1] [--exo=1 [--ankle=1]] [--live=1]`) y una prueba de rendimiento (`--fpstest=segundos [--nowalk=1] [--bvh=f.bvh]`).
 - `modelo/`: el cuerpo exportado de MakeHuman (`cuerpo.obj`) y los pesos de la malla base (`default_weights.mhw`, CC0, de MakeHuman 1.3.0)
 - `animaciones/`: capturas de movimiento de la base de datos de CMU (caminar, correr, saltar, bailar, artes marciales)
 - `lib/`: JavaFX 23.0.2 (jars para Windows de Maven Central)

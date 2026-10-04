@@ -420,7 +420,7 @@ public class Retargeter {
 	 * HumanSkeleton.Builder). Si xRef es paralelo a Z no sirve y se usa
 	 * {@code fallbackX}.
 	 */
-	private static Matrix4 frame(double[] dir, double[] xRef, double[] fallbackX) {
+	static Matrix4 frame(double[] dir, double[] xRef, double[] fallbackX) {
 		if (norm(dir) < 1e-9)
 			return null; // dos articulaciones en el mismo sitio: sin dirección
 		double[] z = normalize(dir);
@@ -446,7 +446,7 @@ public class Retargeter {
 	 * @param sign +1 si la articulación se dobla hacia el +Y local (rodilla) y
 	 *             -1 si hacia el -Y (codo).
 	 */
-	private static Matrix4 bendFrame(double[] a, double[] b, double[] c, int sign, double[] twistRef, double[] fallbackX) {
+	static Matrix4 bendFrame(double[] a, double[] b, double[] c, int sign, double[] twistRef, double[] fallbackX) {
 		double[] z = normalize(sub(b, a)); // dirección del muslo/brazo
 		double[] next = normalize(sub(c, b)); // dirección de la tibia/antebrazo
 		double[] bend = perpendicular(next, z); // hacia dónde se dobla, visto desde el muslo
