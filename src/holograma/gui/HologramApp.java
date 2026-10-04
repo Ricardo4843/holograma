@@ -19,6 +19,8 @@ import holograma.kinematics.HumanSkeleton;
 import holograma.kinematics.Matrix4;
 import holograma.kinematics.Node3D;
 import holograma.kinematics.Segment;
+import holograma.mocap.BvhMotion;
+import holograma.mocap.Retargeter;
 import javafx.animation.AnimationTimer;
 import javafx.animation.PauseTransition;
 import javafx.application.Application;
@@ -38,6 +40,7 @@ import javafx.scene.control.Label;
 import javafx.scene.control.Separator;
 import javafx.scene.control.Slider;
 import javafx.scene.control.ToggleButton;
+import javafx.scene.control.ToggleGroup;
 import javafx.scene.effect.Bloom;
 import javafx.scene.image.PixelReader;
 import javafx.scene.image.WritableImage;
@@ -61,6 +64,7 @@ import javafx.scene.text.Text;
 import javafx.scene.transform.Affine;
 import javafx.scene.transform.Rotate;
 import javafx.scene.transform.Translate;
+import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 import javafx.util.Duration;
 
@@ -94,6 +98,10 @@ import javafx.util.Duration;
  * </ul>
  *
  * Controles: arrastrar con el ratón para girar la cámara, rueda para el zoom.
+ *
+ * Hay dos formas de animarlo: "Caminar" (senos, ver applyWalk) y
+ * "Reproducir" una captura de movimiento real de un fichero .bvh (paquete
+ * mocap). Al arrancar se carga animaciones/caminar.bvh si existe.
  */
 public class HologramApp extends Application {
 
@@ -101,6 +109,8 @@ public class HologramApp extends Application {
 	// Rutas relativas a la carpeta del proyecto (desde donde lo lanzan Eclipse y run.ps1)
 	private static final Path BODY_FILE = Path.of("modelo", "cuerpo.obj");
 	private static final Path WEIGHTS_FILE = Path.of("modelo", "default_weights.mhw");
+	private static final Path ANIMATIONS_DIR = Path.of("animaciones");
+	private static final Path DEFAULT_ANIMATION = ANIMATIONS_DIR.resolve("caminar.bvh");
 	private static final Color HOLO = Color.web("#38d6ff"); // cian del holograma
 
 	// ---- Modelo ----
@@ -110,6 +120,10 @@ public class HologramApp extends Application {
 	private final Map<String, Segment> byName = new HashMap<>(); // búsqueda por nombre
 	private Map<Segment, Matrix4> restInverse; // Frame_reposo^-1 de cada segmento (skinning)
 	private MakeHumanRig rig; // cuerpo de MakeHuman (null si no se ha encontrado)
+	private Retargeter mocap; // animación .bvh cargada (null si no hay ninguna)
+	// Dónde va la pelvis: el origen en reposo, o el que diga la animación .bvh
+	// (que la sube y la baja)
+	private double[] origin;
 
 	// ---- Vista 3D ----
 	private final Group cloudGroup = new Group(); // holograma (nube de puntos)
@@ -142,6 +156,10 @@ public class HologramApp extends Application {
 	private final CheckBox showCloud = new CheckBox("Holograma (nube de puntos)");
 	private final CheckBox showSkeleton = new CheckBox("Esqueleto (segmentos y nodos)");
 	private ToggleButton walkButton;
+	private final ToggleButton playButton = new ToggleButton("Reproducir");
+	private final Label animLabel = new Label();
+	private final Slider speedSlider = new Slider(0.1, 2, 1);
+	private Stage stage;
 
 	// ---- Estado del bucle ----
 	// dirty = "la postura ha cambiado y hay que recalcular". Así no se repite
@@ -152,6 +170,8 @@ public class HologramApp extends Application {
 	// usuario hubiera movido la articulación.
 	private boolean updatingSliders;
 	private double walkTime; // segundos de animación de marcha acumulados
+	private double animTime; // segundos de la animación .bvh (a la velocidad elegida)
+	private long retargetNanos; // lo que tardó el último retargeting
 	private long lastFrame, fpsWindowStart; // marcas de tiempo en nanosegundos
 	private int fpsFrames;
 	private double fps;
@@ -160,6 +180,7 @@ public class HologramApp extends Application {
 	/** Punto de entrada de JavaFX: monta toda la escena y arranca el bucle. */
 	@Override
 	public void start(Stage stage) {
+		this.stage = stage;
 		loadModel();
 		Map<String, String> args = getParameters().getNamed(); // parámetros tipo --points=80000
 		int pointCount = Integer.parseInt(args.getOrDefault("points", "60000"));
@@ -241,9 +262,11 @@ public class HologramApp extends Application {
 			takeSnapshotAndExit(scene, snapshot);
 
 		// Prueba de rendimiento (--fpstest=segundos [--nowalk=1]): camina (o se
-		// queda quieto) ese tiempo, imprime los FPS medios y cierra
+		// queda quieto) ese tiempo, imprime los FPS medios y cierra. Con --bvh,
+		// en vez de caminar reproduce la animación.
 		if (args.containsKey("fpstest")) {
-			walkButton.setSelected(!args.containsKey("nowalk"));
+			if (!args.containsKey("nowalk"))
+				(args.containsKey("bvh") ? playButton : walkButton).setSelected(true);
 			double seconds = Double.parseDouble(args.get("fpstest"));
 			long startFrames = totalFrames;
 			PauseTransition test = new PauseTransition(Duration.seconds(seconds));
@@ -271,11 +294,45 @@ public class HologramApp extends Application {
 			joints = HumanSkeleton.defaultJoints();
 		}
 		skeleton = HumanSkeleton.fromJoints(joints);
+		origin = skeleton.getOrigin();
 		root = skeleton.getRoot();
 		segments = root.flatten();
 		for (Segment s : segments)
 			byName.put(s.getName(), s);
 		restInverse = computeRestInverse();
+
+		// Animación: la de --bvh=fichero o, si no, la de por defecto
+		String bvh = getParameters().getNamed().get("bvh");
+		Path file = bvh != null ? Path.of(bvh) : DEFAULT_ANIMATION;
+		if (bvh != null || file.toFile().exists())
+			loadAnimation(file);
+	}
+
+	/**
+	 * Carga un .bvh y prepara el retargeting. Si falla (fichero roto, o un
+	 * esqueleto con nombres que no se reconocen), lo dice en el panel y se
+	 * queda con la animación que hubiera.
+	 */
+	private void loadAnimation(Path file) {
+		try {
+			BvhMotion motion = BvhMotion.load(file);
+			mocap = new Retargeter(motion, skeleton);
+			animTime = 0;
+			animLabel.setText(String.format("%s: %d fotogramas, %.1f s", motion.getName(), motion.getFrameCount(),
+					motion.getDuration()));
+		} catch (Exception e) {
+			animLabel.setText("No se pudo cargar " + file.getFileName() + ": " + e.getMessage());
+			System.out.println(animLabel.getText());
+		}
+		animLabel.setWrapText(true);
+		playButton.setDisable(mocap == null);
+	}
+
+	/** Pone el esqueleto en la postura de la animación .bvh en el instante animTime. */
+	private void applyAnimation() {
+		long t = System.nanoTime();
+		origin = mocap.apply(mocap.frameAt(animTime));
+		retargetNanos = System.nanoTime() - t;
 	}
 
 	// ================================================================ postura
@@ -296,6 +353,12 @@ public class HologramApp extends Application {
 			refreshSliders();
 			dirty = true;
 		}
+		if (lastFrame != 0 && playButton.isSelected() && mocap != null) {
+			animTime += (now - lastFrame) / 1e9 * speedSlider.getValue();
+			applyAnimation();
+			refreshSliders();
+			dirty = true;
+		}
 		lastFrame = now;
 
 		// Fotogramas por segundo, medidos en ventanas de medio segundo
@@ -312,8 +375,7 @@ public class HologramApp extends Application {
 
 		// 1) Cinemática directa (el algoritmo del lab2, en 3D)
 		long t0 = System.nanoTime();
-		double[] o = skeleton.getOrigin();
-		Node3D tree = ForwardKinematics3D.computePositions(root, o[0], o[1], o[2]);
+		Node3D tree = ForwardKinematics3D.computePositions(root, origin[0], origin[1], origin[2]);
 		Map<Segment, Matrix4> frames = ForwardKinematics3D.frames(tree);
 		long t1 = System.nanoTime();
 
@@ -344,7 +406,8 @@ public class HologramApp extends Application {
 				setAffine(bone, f.multiply(Matrix4.translation(0, 0, s.getLength() / 2))
 						.multiply(Matrix4.rotX(Math.PI / 2)));
 		}
-		statsLabel.setText(String.format("Cinemática directa: %.1f µs%nSkinning: %.2f ms%nFPS: %.0f",
+		String retarget = playButton.isSelected() ? String.format("Retargeting .bvh: %.1f µs%n", retargetNanos / 1e3) : "";
+		statsLabel.setText(String.format("%sCinemática directa: %.1f µs%nSkinning: %.2f ms%nFPS: %.0f", retarget,
 				(t1 - t0) / 1e3, (t2 - t1) / 1e6, fps));
 	}
 
@@ -601,6 +664,8 @@ public class HologramApp extends Application {
 		Button reset = new Button("Postura de reposo");
 		reset.setOnAction(e -> {
 			walkButton.setSelected(false);
+			playButton.setSelected(false);
+			origin = skeleton.getOrigin();
 			// Referencia a método: equivale a s -> s.resetAngles()
 			segments.forEach(Segment::resetAngles);
 			refreshSliders();
@@ -608,13 +673,45 @@ public class HologramApp extends Application {
 		});
 		// ToggleButton: botón que se queda pulsado o no (on/off)
 		walkButton = new ToggleButton("Caminar");
-		walkButton.selectedProperty().addListener((obs, old, on) -> {
-			// Mientras camina, los sliders solo muestran (no se pueden mover)
-			for (Slider s : axisSliders)
-				s.setDisable(on || s.isDisable());
-			if (!on)
-				refreshSliders();
+		// ToggleGroup: como mucho uno de los dos pulsado (al pulsar uno se suelta
+		// el otro). A diferencia de los RadioButton, se pueden soltar los dos.
+		ToggleGroup animations = new ToggleGroup();
+		walkButton.setToggleGroup(animations);
+		playButton.setToggleGroup(animations);
+		for (ToggleButton b : new ToggleButton[] { walkButton, playButton })
+			b.selectedProperty().addListener((obs, old, on) -> {
+				// Mientras se anima, los sliders solo muestran (no se pueden mover)
+				for (Slider s : axisSliders)
+					s.setDisable(on || s.isDisable());
+				if (!on) {
+					// Al parar, la pelvis vuelve a su altura de reposo
+					origin = skeleton.getOrigin();
+					dirty = true;
+					refreshSliders();
+				}
+			});
+
+		// Captura de movimiento (.bvh)
+		Button load = new Button("Cargar .bvh...");
+		load.setOnAction(e -> {
+			// FileChooser: el diálogo de "Abrir" del sistema operativo
+			FileChooser chooser = new FileChooser();
+			chooser.setTitle("Animación de captura de movimiento");
+			chooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("BVH", "*.bvh", "*.BVH"));
+			if (ANIMATIONS_DIR.toFile().isDirectory())
+				chooser.setInitialDirectory(ANIMATIONS_DIR.toAbsolutePath().toFile());
+			File file = chooser.showOpenDialog(stage); // null si se cancela
+			if (file != null) {
+				loadAnimation(file.toPath());
+				playButton.setSelected(mocap != null);
+			}
 		});
+		Label speedLabel = new Label();
+		// bind: el texto se recalcula solo cada vez que cambia el slider
+		speedLabel.textProperty().bind(speedSlider.valueProperty().asString("Velocidad: %.2fx"));
+		playButton.setDisable(mocap == null);
+		if (mocap == null && animLabel.getText().isEmpty())
+			animLabel.setText("Sin animación cargada");
 
 		// Qué se ve. Por defecto el holograma si hay modelo, y si no, el esqueleto.
 		showCloud.setSelected(rig != null);
@@ -634,6 +731,8 @@ public class HologramApp extends Application {
 		});
 
 		box.getChildren().addAll(new Separator(), reset, walkButton, new Separator(),
+				new Label("Captura de movimiento"), load, playButton, animLabel, speedLabel, speedSlider,
+				new Separator(),
 				showCloud, showSkeleton, new Separator(),
 				new Label("Puntos del holograma"), pointSlider, cloudLabel, new Separator(), statsLabel);
 		box.setPadding(new Insets(14));
@@ -660,7 +759,7 @@ public class HologramApp extends Application {
 			sl.setMin(Math.toDegrees(s.getMin(i)));
 			sl.setMax(Math.toDegrees(s.getMax(i)));
 			sl.setValue(Math.toDegrees(s.getAngle(i)));
-			sl.setDisable(!free || walkButton != null && walkButton.isSelected());
+			sl.setDisable(!free || walkButton != null && walkButton.isSelected() || playButton.isSelected());
 			updateAxisLabel(i, s);
 		}
 		updatingSliders = false;
@@ -678,13 +777,19 @@ public class HologramApp extends Application {
 	/**
 	 * Modo captura, para generar imágenes sin tocar el ratón:
 	 * --snapshot=fichero.png [--walk=segundos] [--yaw=grados]
-	 * [--show=cloud,skeleton] [--points=n]. Espera 2 s a que se dibuje la
-	 * escena, la guarda en PNG y cierra.
+	 * [--show=cloud,skeleton] [--points=n] [--bvh=fichero --bvhtime=segundos].
+	 * Espera 2 s a que se dibuje la escena, la guarda en PNG y cierra.
 	 */
 	private void takeSnapshotAndExit(Scene scene, String file) {
 		Map<String, String> args = getParameters().getNamed();
 		if (args.containsKey("walk")) {
 			applyWalk(Double.parseDouble(args.get("walk")));
+			refreshSliders();
+			dirty = true;
+		}
+		if (args.containsKey("bvhtime") && mocap != null) {
+			animTime = Double.parseDouble(args.get("bvhtime"));
+			applyAnimation();
 			refreshSliders();
 			dirty = true;
 		}

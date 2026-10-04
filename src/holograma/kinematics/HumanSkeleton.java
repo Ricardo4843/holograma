@@ -4,6 +4,9 @@ import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
 
+// "import static": permite escribir sub(a, b) en vez de Vec3.sub(a, b)
+import static holograma.kinematics.Vec3.*;
+
 /**
  * Esqueleto humano de cuerpo completo (21 segmentos) con límites articulares
  * aproximados. Sustituye al fichero de texto que se leía en el lab2.
@@ -153,9 +156,12 @@ public class HumanSkeleton {
 					.joint(0, "Flexión", -30, 120)
 					.joint(1, "Abducción", right ? -20 : -45, right ? 45 : 20)
 					.joint(2, "Rotación", -40, 40);
-			// La rodilla es una bisagra: solo el eje X, y solo hacia atrás (negativo)
-			Segment shin = b.add(thigh, "Tibia" + n, "knee" + j, "ankle" + j, false)
-					.joint(0, "Flexión", -140, 0);
+			// La rodilla es una bisagra: solo el eje X, y solo hacia atrás
+			// (negativo). Los límites son anatómicos (0 = pierna recta) y se
+			// corrigen con lo que ya viene doblada en reposo (ver restFlexion).
+			Segment shin = b.add(thigh, "Tibia" + n, "knee" + j, "ankle" + j, false);
+			double knee0 = restFlexion(shin);
+			shin.joint(0, "Flexión", -140 - knee0, 0 - knee0);
 			b.add(shin, "Pie" + n, "ankle" + j, "foot_end" + j, false)
 					.joint(0, "Flexión", -30, 45)
 					.joint(1, "Inversión", -20, 20);
@@ -170,9 +176,12 @@ public class HumanSkeleton {
 					.joint(1, "Abducción", right ? -60 : -150, right ? 150 : 60)
 					.joint(2, "Rotación", -90, 90);
 			// Codo: flexión (X) y pronación/supinación del antebrazo (Z, girar la
-			// muñeca alrededor del propio antebrazo)
-			Segment forearm = b.add(arm, "Antebrazo" + n, "elbow" + j, "wrist" + j, false)
-					.joint(0, "Flexión", -10, 145)
+			// muñeca alrededor del propio antebrazo). Igual que en la rodilla, los
+			// límites anatómicos se corrigen con la flexión de reposo: en la pose
+			// en "A" de MakeHuman el codo ya está doblado unos 40º.
+			Segment forearm = b.add(arm, "Antebrazo" + n, "elbow" + j, "wrist" + j, false);
+			double elbow0 = restFlexion(forearm);
+			forearm.joint(0, "Flexión", -10 - elbow0, 145 - elbow0)
 					.joint(2, "Pronación", -80, 80);
 			b.add(forearm, "Mano" + n, "wrist" + j, "hand_end" + j, false)
 					.joint(0, "Flexión", -70, 80)
@@ -181,9 +190,24 @@ public class HumanSkeleton {
 
 		// Ángulo del brazo derecho con la vertical: arcocoseno de la componente
 		// vertical de su dirección (producto escalar con el vector "abajo")
-		double[] d = Builder.normalize(Builder.sub(joints.get("elbow_D"), joints.get("shoulder_D")));
+		double[] d = Vec3.normalize(Vec3.sub(joints.get("elbow_D"), joints.get("shoulder_D")));
 		double armAngle = Math.toDegrees(Math.acos(-d[2]));
 		return new HumanSkeleton(pelvis, joints.get("pelvis"), armAngle);
+	}
+
+	/**
+	 * Cuánto está ya doblada una articulación en la postura de reposo (grados,
+	 * sobre el eje X). Es el giro X de su rotación base (Matrix4.eulerXYZ).
+	 *
+	 * Hace falta porque los ángulos de Segment son RELATIVOS al reposo (0 =
+	 * como venga el modelo), mientras que los límites anatómicos se miden desde
+	 * la extremidad recta. Si el codo ya viene doblado 40º, el límite "-10º
+	 * desde recto" es "-50º desde el reposo": límite relativo = anatómico -
+	 * reposo. Sin esta corrección, el brazo nunca podría estirarse del todo
+	 * (se notaba al reproducir capturas de movimiento).
+	 */
+	private static double restFlexion(Segment s) {
+		return Math.toDegrees(s.getBase().eulerXYZ()[0]);
 	}
 
 	/**
@@ -247,35 +271,6 @@ public class HumanSkeleton {
 			if (parent != null)
 				parent.addChild(s);
 			return s;
-		}
-
-		// ---- Operaciones con vectores 3D (arrays de 3 doubles) ----
-
-		static double[] sub(double[] a, double[] b) {
-			return new double[] { a[0] - b[0], a[1] - b[1], a[2] - b[2] };
-		}
-
-		static double[] scale(double[] a, double k) {
-			return new double[] { a[0] * k, a[1] * k, a[2] * k };
-		}
-
-		/** Producto escalar: |a||b|cos(ángulo). Vale 0 si son perpendiculares. */
-		static double dot(double[] a, double[] b) {
-			return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-		}
-
-		/** Producto vectorial: vector perpendicular a a y a b (regla de la mano derecha). */
-		static double[] cross(double[] a, double[] b) {
-			return new double[] { a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0] };
-		}
-
-		static double norm(double[] a) {
-			return Math.sqrt(dot(a, a));
-		}
-
-		/** Mismo vector con longitud 1. */
-		static double[] normalize(double[] a) {
-			return scale(a, 1 / norm(a));
 		}
 	}
 }

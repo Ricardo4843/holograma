@@ -204,6 +204,68 @@ public final class Matrix4 {
 		return new Matrix4(r);
 	}
 
+	/** Aplica la transformación completa a un punto: R * p + t. */
+	public double[] transformPoint(double[] p) {
+		double[] d = transformDirection(p);
+		return new double[] { d[0] + m[3], d[1] + m[7], d[2] + m[11] };
+	}
+
+	/**
+	 * Aplica solo la rotación a un vector: R * v. Las direcciones (hacia dónde
+	 * apunta un hueso) se giran pero no se trasladan.
+	 */
+	public double[] transformDirection(double[] v) {
+		return new double[] {
+				m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+				m[4] * v[0] + m[5] * v[1] + m[6] * v[2],
+				m[8] * v[0] + m[9] * v[1] + m[10] * v[2] };
+	}
+
+	/** Columna i de la rotación: el eje local i (0 = X, 1 = Y, 2 = Z) visto desde el mundo. */
+	public double[] axis(int i) {
+		return new double[] { m[i], m[4 + i], m[8 + i] };
+	}
+
+	/** La misma matriz sin la traslación (solo la rotación). */
+	public Matrix4 rotationOnly() {
+		double[] r = m.clone();
+		r[3] = r[7] = r[11] = 0;
+		return new Matrix4(r);
+	}
+
+	/**
+	 * Lo contrario de localTransform de Segment: dada una rotación R, encuentra
+	 * los ángulos (a, b, c) tales que R = rotX(a) * rotY(b) * rotZ(c).
+	 *
+	 * Multiplicando las tres matrices a mano sale:
+	 *
+	 * <pre>
+	 * | cb·cc            -cb·sc             sb    |
+	 * | sa·sb·cc + ca·sc  -sa·sb·sc + ca·cc  -sa·cb |
+	 * | -ca·sb·cc + sa·sc  ca·sb·sc + sa·cc   ca·cb |
+	 * </pre>
+	 *
+	 * (ca = cos a, sb = sin b...). De ahí se despejan los ángulos:
+	 * <ul>
+	 * <li>b = asin(r02)</li>
+	 * <li>a = atan2(-r12, r22), porque r12 = -sa·cb y r22 = ca·cb</li>
+	 * <li>c = atan2(-r01, r00), porque r01 = -cb·sc y r00 = cb·cc</li>
+	 * </ul>
+	 * atan2(y, x) es el arcotangente de y/x, pero mirando los signos de los dos
+	 * para saber el cuadrante (devuelve de -180º a 180º, no solo de -90º a 90º).
+	 * Cuando b = ±90º (cb = 0) a y c no se pueden distinguir (es el famoso
+	 * "bloqueo de cardán", gimbal lock), pero atan2 sigue devolviendo algo válido.
+	 *
+	 * @return {a, b, c} en radianes.
+	 */
+	public double[] eulerXYZ() {
+		// Se recorta a [-1, 1] por si el redondeo deja un 1,0000000002 (asin daría NaN)
+		double b = Math.asin(Math.max(-1, Math.min(1, m[2])));
+		double a = Math.atan2(-m[6], m[10]);
+		double c = Math.atan2(-m[1], m[0]);
+		return new double[] { a, b, c };
+	}
+
 	/** Coordenada X de la traslación: dónde está el origen de este sistema. */
 	public double tx() {
 		return m[3];
