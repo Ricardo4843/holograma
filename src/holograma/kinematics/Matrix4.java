@@ -266,6 +266,32 @@ public final class Matrix4 {
 		return new double[] { a, b, c };
 	}
 
+	/**
+	 * Vector de rotación de esta matriz (que debe ser una rotación pura): un
+	 * vector que apunta en la dirección del EJE de giro y mide el ÁNGULO
+	 * girado, en radianes. Toda rotación 3D es un único giro alrededor de algún
+	 * eje (teorema de rotación de Euler), y esto lo saca de la matriz:
+	 * <ul>
+	 * <li>Ángulo: la traza (suma de la diagonal) de una rotación vale 1 + 2
+	 * cos(ángulo), así que ángulo = acos((traza - 1) / 2).</li>
+	 * <li>Eje: la parte antisimétrica de la matriz, (R - R^T) / 2, contiene
+	 * sin(ángulo) por el eje, en las posiciones (2,1), (0,2) y (1,0).</li>
+	 * </ul>
+	 * Se usa en la dinámica para sacar la velocidad angular: si un segmento
+	 * gira R entre dos fotogramas separados h segundos, su velocidad angular
+	 * es el vector de rotación de R dividido entre h.
+	 */
+	public double[] rotationVector() {
+		double cos = Math.max(-1, Math.min(1, (m[0] + m[5] + m[10] - 1) / 2));
+		double angle = Math.acos(cos);
+		double[] v = { m[9] - m[6], m[2] - m[8], m[4] - m[1] }; // = 2 sin(ángulo) * eje
+		double sin = Math.sin(angle);
+		// Con ángulos muy pequeños sin(ángulo) ~ ángulo, y v / 2 ya es el
+		// resultado (así no se divide entre casi 0)
+		double k = sin < 1e-9 ? 0.5 : angle / (2 * sin);
+		return new double[] { v[0] * k, v[1] * k, v[2] * k };
+	}
+
 	/** Coordenada X de la traslación: dónde está el origen de este sistema. */
 	public double tx() {
 		return m[3];

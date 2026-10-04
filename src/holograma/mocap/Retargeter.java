@@ -109,6 +109,9 @@ public class Retargeter {
 	private final double scale;
 	private final double[] lift; // cuánto hay que subir o bajar la pelvis en cada fotograma
 	private final Segment[] feet; // Pie D y Pie I
+	// Primer fotograma de la animación de verdad: 1 si el 0 es una postura de
+	// referencia (ver detectReferencePose), 0 si no
+	private final int first;
 	// Corrección de la inclinación de cada pie (ver footPitchOffset)
 	private final Map<String, Double> footOffset = new HashMap<>();
 
@@ -148,20 +151,23 @@ public class Retargeter {
 		firstPose = motion.pose(0);
 		toOurs = detectAxes(firstPose);
 
+		first = detectReferencePose() ? 1 : 0;
+
 		// 3) Escala para la altura de la pelvis y corrección de los pies. Se
 		// recorre la animación entera una vez (cinemática del .bvh en cada
-		// fotograma) y se guarda lo que hace falta.
-		int n = motion.getFrameCount();
+		// fotograma) y se guarda lo que hace falta. Los arrays van por
+		// fotograma jugable: la posición i es el fotograma first + i.
+		int n = motion.getFrameCount(), count = n - first;
 		Map<String, double[]> ankleHeight = new HashMap<>(), footPitch = new HashMap<>();
 		for (String side : new String[] { "_D", "_I" }) {
-			ankleHeight.put(side, new double[n]);
-			footPitch.put(side, new double[n]);
+			ankleHeight.put(side, new double[count]);
+			footPitch.put(side, new double[count]);
 		}
-		for (int f = 0; f < n; f++) {
-			Frame fr = new Frame(motion.pose(f));
+		for (int i = 0; i < count; i++) {
+			Frame fr = new Frame(motion.pose(first + i));
 			for (String side : new String[] { "_D", "_I" }) {
-				ankleHeight.get(side)[f] = fr.pos("ankle" + side)[2];
-				footPitch.get(side)[f] = pitch(sub(fr.toe(side), fr.pos("ankle" + side)));
+				ankleHeight.get(side)[i] = fr.pos("ankle" + side)[2];
+				footPitch.get(side)[i] = pitch(sub(fr.toe(side), fr.pos("ankle" + side)));
 			}
 		}
 		Frame f0 = new Frame(firstPose);
@@ -181,18 +187,28 @@ public class Retargeter {
 		// 5) Contacto con el suelo (ver findFloor): se pone el esqueleto en
 		// cada fotograma, con la pelvis a la altura que dice el .bvh, y se mira
 		// dónde queda el punto más bajo de NUESTROS pies.
-		double[] lowest = new double[n];
-		for (int f = 0; f < n; f++) {
-			Frame fr = new Frame(motion.pose(f));
+		double[] lowest = new double[count];
+		for (int i = 0; i < count; i++) {
+			Frame fr = new Frame(motion.pose(first + i));
 			place(root, Matrix4.identity(), fr, false);
-			lowest[f] = lowestFootPoint(rawHeight(fr));
+			lowest[i] = lowestFootPoint(rawHeight(fr));
 		}
 		double[] floor = findFloor(lowest, (int) Math.round(0.4 / motion.getFrameTime()));
 		// Hay que mover la pelvis para que ese suelo quede a la altura que tienen
 		// nuestros pies en reposo
+		double[] raw = new double[count];
+		for (int i = 0; i < count; i++)
+			raw[i] = foot[0] - floor[i];
+		// El mínimo en ventana cambia "a escalones" (cuando entra o sale de la
+		// ventana el punto más bajo), y un escalón de unos centímetros entre dos
+		// fotogramas es una aceleración enorme para la dinámica inversa. Se
+		// suaviza con una media móvil de +-0,15 s aplicada dos veces (que se
+		// parece a un filtro gaussiano).
+		int half = Math.max(1, (int) Math.round(0.15 / motion.getFrameTime()));
+		double[] smooth = movingAverage(movingAverage(raw, half), half);
 		lift = new double[n];
 		for (int f = 0; f < n; f++)
-			lift[f] = foot[0] - floor[f];
+			lift[f] = smooth[Math.max(0, f - first)]; // el de referencia usa el del primero jugable
 		restoreAngles(saved);
 	}
 
@@ -209,6 +225,26 @@ public class Retargeter {
 		Frame f = new Frame(motion.pose(frame));
 		place(root, Matrix4.identity(), f, false);
 		return new double[] { origin[0], origin[1], rawHeight(f) + lift[frame] };
+	}
+
+	/**
+	 * Como apply, pero con la pelvis donde estaría SIN la cinta de correr: se
+	 * le suma lo que se ha desplazado en horizontal la cadera del .bvh desde
+	 * el primer fotograma (escalado a nuestro tamaño). No cambia la postura;
+	 * hay que llamarlo después de apply(frame).
+	 *
+	 * Para verlo da igual, pero para la dinámica inversa no: al caminar el
+	 * cuerpo frena un poco al apoyar el talón y acelera al impulsarse, y esas
+	 * aceleraciones son las que inclinan la fuerza del suelo hacia atrás o
+	 * hacia delante. Con la pelvis fija desaparecen y los pares de la cadera
+	 * salen varias veces más grandes de lo real. (Moverse a velocidad
+	 * constante no cambia nada: las leyes de Newton son las mismas en una cinta
+	 * de correr que en el suelo, porque la cinta no acelera.)
+	 */
+	public double[] travelledOrigin(int frame) {
+		Frame f = new Frame(motion.pose(frame)), start = new Frame(motion.pose(first));
+		double[] d = scale(sub(f.pos("hips"), start.pos("hips")), scale);
+		return new double[] { origin[0] + d[0], origin[1] + d[1], rawHeight(f) + lift[frame] };
 	}
 
 	/** Altura de la cadera del .bvh, escalada a nuestras piernas (sin corregir el suelo). */
@@ -232,11 +268,43 @@ public class Retargeter {
 		return low;
 	}
 
-	/** Fotograma que toca a los t segundos, en bucle (al acabar vuelve a empezar). */
+	/**
+	 * Fotograma que toca a los t segundos, en bucle (al acabar vuelve a
+	 * empezar). Se salta el fotograma de referencia si lo hay.
+	 */
 	public int frameAt(double seconds) {
-		int n = motion.getFrameCount();
+		int n = motion.getFrameCount() - first;
 		int f = (int) Math.floor(seconds / motion.getFrameTime()) % n;
-		return f < 0 ? f + n : f;
+		return first + (f < 0 ? f + n : f);
+	}
+
+	/** Primer fotograma que se reproduce (0, o 1 si el 0 es la postura de referencia). */
+	public int getFirstFrame() {
+		return first;
+	}
+
+	/**
+	 * Muchos .bvh (los de CMU convertidos por cgspeed, por ejemplo) guardan en
+	 * el fotograma 0 una postura de REFERENCIA en "T", y la animación de verdad
+	 * empieza en el 1. Si se reproduce, el muñeco pega un salto de la T a la
+	 * primera postura en 1/120 s, que para la dinámica inversa es una
+	 * aceleración gigantesca.
+	 *
+	 * Se detecta comparando los fotogramas 0 y 1: en una grabación normal, en
+	 * 1/30 s o menos ninguna articulación gira más de unos pocos grados. Si
+	 * alguna gira más de 25º, el 0 no forma parte del movimiento. (Para la
+	 * calibración sí se sigue usando, y viene muy bien: es la postura neutra.)
+	 */
+	private boolean detectReferencePose() {
+		if (motion.getFrameCount() < 3)
+			return false;
+		Matrix4[] a = motion.pose(0), b = motion.pose(1);
+		for (int i = 0; i < a.length; i++) {
+			Matrix4 change = b[i].rotationOnly().multiply(a[i].rotationOnly().rigidInverse());
+			if (norm(change.rotationVector()) > Math.toRadians(25))
+				return true;
+		}
+		return false;
 	}
 
 	public BvhMotion getMotion() {
@@ -555,6 +623,19 @@ public class Retargeter {
 				floor[f] = Math.min(floor[f], lowest[g]);
 		}
 		return floor;
+	}
+
+	/** Media de cada valor con sus vecinos a +-half posiciones (en los bordes, los que haya). */
+	private static double[] movingAverage(double[] v, int half) {
+		double[] out = new double[v.length];
+		for (int i = 0; i < v.length; i++) {
+			double sum = 0;
+			int from = Math.max(0, i - half), to = Math.min(v.length - 1, i + half);
+			for (int j = from; j <= to; j++)
+				sum += v[j];
+			out[i] = sum / (to - from + 1);
+		}
+		return out;
 	}
 
 	/**

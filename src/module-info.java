@@ -18,4 +18,5 @@ module holograma {
 	exports holograma.kinematics;
 	exports holograma.body;
 	exports holograma.mocap;
+	exports holograma.dynamics;
 }

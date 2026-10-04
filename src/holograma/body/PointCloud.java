@@ -78,12 +78,13 @@ public class PointCloud {
 	 * mismo peso (level / LEVELS para a, el resto para b). Es un "record" porque
 	 * solo agrupa datos.
 	 */
-	private record Bucket(int a, int b, int level, Affine affine) {
+	private record Bucket(int a, int b, int level, Affine affine, MeshView view) {
 	}
 
 	private final Group node = new Group(); // todas las mallas de la nube
 	private final List<Bucket> buckets = new ArrayList<>();
 	private final int count;
+	private final Material material; // color normal (sin mapa de esfuerzo)
 
 	/**
 	 * @param rig      malla del cuerpo con sus pesos
@@ -94,6 +95,7 @@ public class PointCloud {
 	 */
 	public PointCloud(MakeHumanRig rig, int count, double size, long seed, Material material) {
 		this.count = count;
+		this.material = material;
 		ObjMesh m = rig.getMesh();
 		double[][] w = rig.getWeights();
 		double[] cumulative = cumulativeAreas(m);
@@ -144,8 +146,8 @@ public class PointCloud {
 		// REPOSO; la Affine del cubo los llevará a la postura actual.
 		for (Map.Entry<Integer, List<Float>> e : pointsByBucket.entrySet()) {
 			int key = e.getKey();
-			Bucket bucket = new Bucket(key / 10000, (key / 100) % 100, key % 100, new Affine());
 			MeshView view = new MeshView(tetraMesh(e.getValue()));
+			Bucket bucket = new Bucket(key / 10000, (key / 100) % 100, key % 100, new Affine(), view);
 			view.setMaterial(material);
 			// Que se dibujen las dos caras de cada triángulo (por defecto JavaFX
 			// oculta las que miran hacia atrás para ahorrar trabajo)
@@ -222,6 +224,35 @@ public class PointCloud {
 			b.affine().setToTransform(mm[0], mm[1], mm[2], mm[3], mm[4], mm[5], mm[6], mm[7], mm[8], mm[9],
 					mm[10], mm[11]);
 		}
+	}
+
+	/**
+	 * Colorea la nube según un valor por segmento (el esfuerzo de cada
+	 * articulación, de 0 a 1). Cada cubo mezcla los valores de sus dos huesos
+	 * con el mismo peso que usa para moverse, así que el color cambia de forma
+	 * gradual al pasar de un segmento a otro, como un mapa de calor.
+	 *
+	 * Los colores vienen ya creados en una paleta (un material por nivel): así
+	 * no hay que crear materiales nuevos en cada fotograma, solo cambiar cuál
+	 * usa cada malla, y solo si ha cambiado.
+	 *
+	 * @param values  valor de cada segmento, en el orden de MakeHumanRig.SEGMENTS
+	 * @param palette materiales de menos (0) a más (1) esfuerzo
+	 */
+	public void colorBy(double[] values, Material[] palette) {
+		for (Bucket b : buckets) {
+			double wa = (double) b.level() / LEVELS;
+			double v = wa * values[b.a()] + (1 - wa) * values[b.b()];
+			int i = (int) Math.round(Math.max(0, Math.min(1, v)) * (palette.length - 1));
+			if (b.view().getMaterial() != palette[i])
+				b.view().setMaterial(palette[i]);
+		}
+	}
+
+	/** Vuelve al color normal. */
+	public void resetColor() {
+		for (Bucket b : buckets)
+			b.view().setMaterial(material);
 	}
 
 	/** Nodo de JavaFX con toda la nube (para añadirlo a la escena). */

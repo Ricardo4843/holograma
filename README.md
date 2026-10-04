@@ -4,9 +4,9 @@ Etapa 3 de la ampliación del lab2 de ALED (Recursividad: cinemática directa de
 
 ![holograma](docs/holograma.png)
 
-| Caminando | Esqueleto dentro del holograma | Captura de movimiento real (.bvh) |
-|---|---|---|
-| ![caminando](docs/holograma-caminando.png) | ![esqueleto](docs/esqueleto.png) | ![mocap](docs/holograma-mocap.png) |
+| Caminando | Esqueleto dentro del holograma | Captura de movimiento real (.bvh) | Mapa de esfuerzo (corriendo) |
+|---|---|---|---|
+| ![caminando](docs/holograma-caminando.png) | ![esqueleto](docs/esqueleto.png) | ![mocap](docs/holograma-mocap.png) | ![esfuerzo](docs/holograma-esfuerzo.png) |
 
 ## Las tres etapas
 
@@ -25,8 +25,9 @@ Controles:
 - Arrastrar el ratón para girar la cámara y la rueda para el zoom.
 - En el panel se elige una articulación y se mueve con los sliders.
 - Botones para caminar y para volver a la postura de reposo.
-- **Captura de movimiento:** "Reproducir" mueve el holograma con una grabación real de una persona (`.bvh`). Al arrancar se carga `animaciones/caminar.bvh`. Con "Cargar .bvh..." se elige otra (correr, saltar, bailar, artes marciales o cualquier `.bvh` descargado), y el slider cambia la velocidad.
+- **Captura de movimiento:** "Reproducir" mueve el holograma con una grabación real de una persona (`.bvh`). Al arrancar se carga `animaciones/caminar.bvh`. Con "Cargar .bvh..." se elige otra (correr, saltar, bailar, artes marciales o cualquier `.bvh` descargado), y el slider cambia la velocidad (a 0 se queda en pausa).
 - Se puede mostrar el holograma, el esqueleto o los dos.
+- **Mapa de esfuerzo:** calcula el par de cada articulación (dinámica inversa) y colorea el holograma de cian a amarillo a rojo según lo cerca que esté de su par máximo. En el panel sale una tabla con los N·m de cada articulación (derecha, izquierda y el pico desde que se empezó), la fuerza del suelo y la fuerza residual. La masa corporal se cambia con un slider.
 - Hay un slider para el número de puntos (de 10.000 a 300.000).
 
 ## Cómo funciona
@@ -42,6 +43,12 @@ Controles:
    - Para cada segmento nuestro, la orientación que debería tener en el mundo: el eje Z va de una articulación a otra (muslo = de `RightUpLeg` a `RightLeg`). El giro sobre su propio eje sale del plano de la rodilla o el codo, que son bisagras, y si no, de cuánto ha girado esa articulación del `.bvh` desde el primer fotograma.
    - Recorriendo el árbol desde la pelvis (recursivo), se pasa a ángulos locales, `local = (padre · base)⁻¹ · deseada`, y se descompone en ángulos de Euler (`Matrix4.eulerXYZ`). Los límites articulares recortan lo imposible, y cada hijo se calcula con la orientación real del padre, ya recortada, para que los errores no se acumulen.
    - Los nombres de las articulaciones se reconocen en los formatos más comunes (CMU, Mixamo, Bandai Namco...), y los ejes del fichero (Y o Z arriba) se deducen solos. El retargeting tarda unos 20 µs por fotograma.
+
+7. **Los pares articulares (dinámica inversa).** `InverseDynamics` hace Newton-Euler recursivo. Cada segmento tiene masa, centro de masas e inercia (tablas de de Leva, 1996, escaladas a la masa corporal), y necesita una fuerza `m·a` y un momento `I·α + ω×(I·ω)` para moverse como se mueve. Recorriendo el árbol **de las hojas a la raíz** (postorden, al revés que la cinemática directa), en cada articulación se despeja lo que tiene que hacer el padre, sabiendo ya lo que hacen los hijos:
+   - Las velocidades y aceleraciones salen por diferencias finitas, con la postura 0,08 s antes y después. Un paso más corto amplifica el ruido de la captura (al caminar salían fuerzas de 4 veces el peso), y 0,08 s hace de filtro de unos 6 Hz, como en los laboratorios de biomecánica.
+   - Como no hay plataformas de fuerza, la fuerza del suelo se estima: es la que necesita el cuerpo entero (`Σ m·(a − g)`), aplicada en el centro de presión que equilibra el momento total. Ese punto se limita al polígono de apoyo de los pies (envolvente convexa por cadena monótona), y si con dos pies se reparte con la regla de la palanca. Lo que no cuadra queda como **fuerza residual** en la pelvis.
+   - Para la física se usa la trayectoria real de la cadera, no la de "cinta de correr" del dibujo: sin los frenazos y acelerones de cada paso, la cadera salía con pares 2 veces mayores.
+   - Resultado con `caminar.bvh` y 70 kg: tobillo ~115 N·m, rodilla ~90 y cadera ~130 de pico, y una fuerza del suelo de 1,3 veces el peso. Al correr, tobillo ~230 y 2,2 veces el peso. Son del orden de los valores publicados, pero orientativos: masas de una persona media, sin músculos (es el par neto) y con un par máximo por articulación aproximado.
 
 ### Rendimiento: de 5 a 60 FPS
 
@@ -60,9 +67,10 @@ Resultado medido caminando (`--fpstest=8`):
 ## Estructura
 
 - `src/holograma/kinematics/`: `Matrix4`, `Vec3`, `Segment`, `Node3D`, `ForwardKinematics3D` (recursiva + iterativa), `HumanSkeleton` (esqueleto construido a partir de las articulaciones)
+- `src/holograma/dynamics/`: `InverseDynamics` (pares articulares por Newton-Euler recursivo, fuerza del suelo y polígono de apoyo)
 - `src/holograma/mocap/`: `BvhMotion` (lector de `.bvh` y su cinemática directa), `Retargeter` (pasa el movimiento del esqueleto del `.bvh` al nuestro)
 - `src/holograma/body/`: `ObjMesh` (lector de .obj), `JsonParser` (JSON por descenso recursivo), `MakeHumanRig` (pesos y articulaciones), `PointCloud` (holograma)
-- `src/holograma/gui/HologramApp.java`: visor JavaFX. Tiene también un modo captura (`--snapshot=f.png [--walk=s] [--yaw=grados] [--show=cloud,skeleton] [--points=n] [--bvh=f.bvh --bvhtime=s]`) y una prueba de rendimiento (`--fpstest=segundos [--nowalk=1] [--bvh=f.bvh]`).
+- `src/holograma/gui/HologramApp.java`: visor JavaFX. Tiene también un modo captura (`--snapshot=f.png [--walk=s] [--yaw=grados] [--show=cloud,skeleton] [--points=n] [--bvh=f.bvh --bvhtime=s] [--effort=1]`) y una prueba de rendimiento (`--fpstest=segundos [--nowalk=1] [--bvh=f.bvh]`).
 - `modelo/`: el cuerpo exportado de MakeHuman (`cuerpo.obj`) y los pesos de la malla base (`default_weights.mhw`, CC0, de MakeHuman 1.3.0)
 - `animaciones/`: capturas de movimiento de la base de datos de CMU (caminar, correr, saltar, bailar, artes marciales)
 - `lib/`: JavaFX 23.0.2 (jars para Windows de Maven Central)
@@ -72,7 +80,8 @@ Para usar otro cuerpo: en MakeHuman, exportar como Wavefront obj en centímetros
 ## Ideas para seguir
 
 - Cinemática inversa: dar la posición de la mano o del pie y calcular los ángulos (CCD o jacobiano).
-- Dinámica real (masas, pares en los motores, interacción con el cuerpo): eso ya no es para JavaFX. Habría que pasar a OpenSim (tiene API Java) o a MuJoCo (Python).
+- Exoesqueleto virtual: actuadores en rodilla y cadera que den parte del par que ya calcula `InverseDynamics`, y ver cuánto le quitan al cuerpo.
+- Dinámica con músculos (no solo el par neto) o simulación directa: eso ya no es para JavaFX. Habría que pasar a OpenSim (tiene API Java) o a MuJoCo (Python).
 
 Para más animaciones: la [base de datos de CMU](http://mocap.cs.cmu.edu/) tiene más de 2.500 en `.bvh` (conversión de cgspeed; hay copias en GitHub, por ejemplo [una-dinosauria/cmu-mocap](https://github.com/una-dinosauria/cmu-mocap)), y también funcionan las de Mixamo y las del dataset de Bandai Namco.
 

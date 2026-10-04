@@ -5,6 +5,7 @@ import java.io.File;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -14,6 +15,7 @@ import javax.imageio.ImageIO;
 
 import holograma.body.MakeHumanRig;
 import holograma.body.PointCloud;
+import holograma.dynamics.InverseDynamics;
 import holograma.kinematics.ForwardKinematics3D;
 import holograma.kinematics.HumanSkeleton;
 import holograma.kinematics.Matrix4;
@@ -37,6 +39,7 @@ import javafx.scene.control.Button;
 import javafx.scene.control.CheckBox;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.Label;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.control.Separator;
 import javafx.scene.control.Slider;
 import javafx.scene.control.ToggleButton;
@@ -102,6 +105,10 @@ import javafx.util.Duration;
  * Hay dos formas de animarlo: "Caminar" (senos, ver applyWalk) y
  * "Reproducir" una captura de movimiento real de un fichero .bvh (paquete
  * mocap). Al arrancar se carga animaciones/caminar.bvh si existe.
+ *
+ * Con "Mapa de esfuerzo" se calculan los pares de las articulaciones
+ * (dinámica inversa, paquete dynamics) y el holograma se colorea según lo
+ * cerca que está cada articulación de su par máximo.
  */
 public class HologramApp extends Application {
 
@@ -121,6 +128,7 @@ public class HologramApp extends Application {
 	private Map<Segment, Matrix4> restInverse; // Frame_reposo^-1 de cada segmento (skinning)
 	private MakeHumanRig rig; // cuerpo de MakeHuman (null si no se ha encontrado)
 	private Retargeter mocap; // animación .bvh cargada (null si no hay ninguna)
+	private InverseDynamics dynamics; // pares articulares
 	// Dónde va la pelvis: el origen en reposo, o el que diga la animación .bvh
 	// (que la sube y la baja)
 	private double[] origin;
@@ -153,12 +161,25 @@ public class HologramApp extends Application {
 	private final Label[] axisLabels = new Label[3];
 	private final Label cloudLabel = new Label();
 	private final Label statsLabel = new Label();
+	private final CheckBox effortBox = new CheckBox("Mapa de esfuerzo (pares)");
+	private final Slider massSlider = new Slider(40, 120, 70);
+	private final Label effortLabel = new Label();
+	// Pico de par de cada articulación desde la última vez que se reinició
+	// (al cargar o reproducir una animación, cambiar la masa o volver al reposo)
+	private final Map<String, Double> peaks = new HashMap<>();
+	// Paletas de colores del mapa de esfuerzo (ver buildPalettes)
+	private static final int PALETTE_SIZE = 32;
+	private static final double DYNAMICS_STEP = 0.08; // paso de las diferencias finitas (s), ver showEffort
+	private PhongMaterial[] cloudPalette, sparkPalette, jointPalette;
+	private PhongMaterial jointMat; // color normal de las esferas
+	private final Map<Segment, Sphere> jointSpheres = new IdentityHashMap<>();
+	private boolean colored; // si ahora mismo se ve el mapa de esfuerzo
 	private final CheckBox showCloud = new CheckBox("Holograma (nube de puntos)");
 	private final CheckBox showSkeleton = new CheckBox("Esqueleto (segmentos y nodos)");
 	private ToggleButton walkButton;
 	private final ToggleButton playButton = new ToggleButton("Reproducir");
 	private final Label animLabel = new Label();
-	private final Slider speedSlider = new Slider(0.1, 2, 1);
+	private final Slider speedSlider = new Slider(0, 2, 1); // 0 = en pausa (la dinámica sigue usando la animación)
 	private Stage stage;
 
 	// ---- Estado del bucle ----
@@ -241,7 +262,10 @@ public class HologramApp extends Application {
 
 		// BorderPane: la vista 3D en el centro y el panel a la izquierda
 		BorderPane layout = new BorderPane(viewport);
-		layout.setLeft(buildControls());
+		// ScrollPane: si el panel no cabe en la ventana, sale una barra para bajar
+		ScrollPane panel = new ScrollPane(buildControls());
+		panel.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+		layout.setLeft(panel);
 		Scene scene = new Scene(layout, 1200, 800);
 		stage.setTitle("Holograma");
 		stage.setScene(scene);
@@ -256,6 +280,10 @@ public class HologramApp extends Application {
 				frame(now);
 			}
 		}.start();
+
+		// --effort=1: arranca con el mapa de esfuerzo activado
+		if (args.containsKey("effort"))
+			effortBox.setSelected(true);
 
 		String snapshot = args.get("snapshot");
 		if (snapshot != null)
@@ -300,6 +328,7 @@ public class HologramApp extends Application {
 		for (Segment s : segments)
 			byName.put(s.getName(), s);
 		restInverse = computeRestInverse();
+		dynamics = new InverseDynamics(skeleton);
 
 		// Animación: la de --bvh=fichero o, si no, la de por defecto
 		String bvh = getParameters().getNamed().get("bvh");
@@ -318,8 +347,9 @@ public class HologramApp extends Application {
 			BvhMotion motion = BvhMotion.load(file);
 			mocap = new Retargeter(motion, skeleton);
 			animTime = 0;
-			animLabel.setText(String.format("%s: %d fotogramas, %.1f s", motion.getName(), motion.getFrameCount(),
-					motion.getDuration()));
+			resetPeaks();
+			animLabel.setText(String.format("%s: %d fotogramas, %.1f s", motion.getName(),
+					motion.getFrameCount() - mocap.getFirstFrame(), motion.getDuration()));
 		} catch (Exception e) {
 			animLabel.setText("No se pudo cargar " + file.getFileName() + ": " + e.getMessage());
 			System.out.println(animLabel.getText());
@@ -406,9 +436,163 @@ public class HologramApp extends Application {
 				setAffine(bone, f.multiply(Matrix4.translation(0, 0, s.getLength() / 2))
 						.multiply(Matrix4.rotX(Math.PI / 2)));
 		}
+		// 5) Pares articulares (dinámica inversa) y mapa de esfuerzo
+		long t3 = System.nanoTime();
+		if (effortBox.isSelected())
+			showEffort(frames);
+		else if (colored)
+			clearEffort();
+		long t4 = System.nanoTime();
+
 		String retarget = playButton.isSelected() ? String.format("Retargeting .bvh: %.1f µs%n", retargetNanos / 1e3) : "";
-		statsLabel.setText(String.format("%sCinemática directa: %.1f µs%nSkinning: %.2f ms%nFPS: %.0f", retarget,
-				(t1 - t0) / 1e3, (t2 - t1) / 1e6, fps));
+		String dyn = effortBox.isSelected() ? String.format("Dinámica inversa: %.1f µs%n", (t4 - t3) / 1e3) : "";
+		statsLabel.setText(String.format("%sCinemática directa: %.1f µs%nSkinning: %.2f ms%n%sFPS: %.0f", retarget,
+				(t1 - t0) / 1e3, (t2 - t1) / 1e6, dyn, fps));
+	}
+
+	// ================================================================ esfuerzo
+
+	/**
+	 * Calcula los pares con la dinámica inversa, colorea el holograma y las
+	 * esferas, y rellena la tabla del panel.
+	 *
+	 * La dinámica necesita velocidades y aceleraciones, que salen de comparar
+	 * la postura actual con la de un poco antes y un poco después (diferencias
+	 * finitas). Según lo que se esté viendo:
+	 * <ul>
+	 * <li>Animación .bvh: los fotogramas de DYNAMICS_STEP (0,08 s) antes y
+	 * después, con la pelvis en su trayectoria real (ver
+	 * Retargeter.travelledOrigin). No se usa el fotograma de al lado (1/120 s
+	 * en CMU) porque al derivar dos veces el ruido de la captura se multiplica
+	 * por 1/h²: con 1/120 s la fuerza del suelo salía hasta 4 veces el peso al
+	 * caminar. Un paso de 0,08 s hace de filtro paso bajo de unos 6 Hz, que es
+	 * lo que se usa en los laboratorios de biomecánica antes de derivar.</li>
+	 * <li>Marcha con senos: lo mismo, con applyWalk en t - h y t + h.</li>
+	 * <li>Quieto (sliders): la misma postura tres veces, es decir, solo
+	 * gravedad (caso estático).</li>
+	 * </ul>
+	 * Después de calcular las posturas vecinas hay que volver a poner la
+	 * actual, porque applyWalk y Retargeter.apply cambian los ángulos.
+	 */
+	private void showEffort(Map<Segment, Matrix4> frames) {
+		Map<Segment, Matrix4> prev = frames, cur = frames, next = frames;
+		double h = 1;
+		boolean standing = true;
+		if (playButton.isSelected() && mocap != null) {
+			double dt = mocap.getMotion().getFrameTime();
+			int k = Math.max(1, (int) Math.round(DYNAMICS_STEP / dt));
+			int f = mocap.frameAt(animTime), n = mocap.getMotion().getFrameCount();
+			// En los extremos de la animación no hay fotograma anterior o siguiente:
+			// se recorta (Math.max/min) y esos pocos fotogramas salen menos precisos
+			int before = Math.max(mocap.getFirstFrame(), f - k), after = Math.min(n - 1, f + k);
+			mocap.apply(before);
+			prev = framesAt(mocap.travelledOrigin(before));
+			mocap.apply(after);
+			next = framesAt(mocap.travelledOrigin(after));
+			mocap.apply(f); // vuelve a la postura actual
+			cur = framesAt(mocap.travelledOrigin(f));
+			h = k * dt;
+			standing = false; // con .bvh hay suelo de verdad: se puede estar en el aire
+		} else if (walkButton.isSelected()) {
+			h = DYNAMICS_STEP;
+			applyWalk(walkTime - h);
+			prev = framesAt(origin);
+			applyWalk(walkTime + h);
+			next = framesAt(origin);
+			applyWalk(walkTime);
+		}
+
+		dynamics.setBodyMass(massSlider.getValue());
+		InverseDynamics.Result r = dynamics.compute(prev, cur, next, h, standing);
+
+		// Colores: valor de cada segmento en el orden de MakeHumanRig.SEGMENTS
+		if (rig != null) {
+			double[] values = new double[MakeHumanRig.SEGMENTS.length];
+			for (int i = 0; i < values.length; i++)
+				values[i] = r.effort().get(byName.get(MakeHumanRig.SEGMENTS[i]));
+			clouds.get(0).colorBy(values, cloudPalette);
+			clouds.get(1).colorBy(values, sparkPalette);
+		}
+		for (Segment s : segments) {
+			double e = Math.max(0, Math.min(1, r.effort().get(s)));
+			jointSpheres.get(s).setMaterial(jointPalette[(int) Math.round(e * (PALETTE_SIZE - 1))]);
+		}
+		colored = true;
+
+		// Tabla: articulaciones centrales en una columna, las de los lados en
+		// dos (D e I), y el pico de cada fila desde el último reinicio
+		Map<String, double[]> rows = new LinkedHashMap<>(); // nombre -> {D, I}; LinkedHashMap mantiene el orden
+		for (InverseDynamics.Joint j : r.joints()) {
+			String name = j.name();
+			int col = name.endsWith(" I") ? 1 : 0;
+			String row = name.endsWith(" D") || name.endsWith(" I") ? name.substring(0, name.length() - 2) : name;
+			if (row.equals("Cabeza"))
+				continue; // se ve en el color; en la tabla no aporta y ocupa sitio
+			rows.computeIfAbsent(row, x -> new double[] { Double.NaN, Double.NaN })[col] = j.torque();
+			peaks.merge(row, j.torque(), Math::max); // guarda el mayor de los dos
+		}
+		StringBuilder sb = new StringBuilder(String.format("%-9s%6s%6s%7s%n", "N·m", "D", "I", "pico"));
+		rows.forEach((row, v) -> sb.append(String.format("%-9s%6s%6s%7.0f%n", row, number(v[0]), number(v[1]), peaks.get(row))));
+		double weight = massSlider.getValue() * 9.81;
+		sb.append(String.format("%nApoyo: %s%nSuelo: %.0f N (%.1f veces el peso)%nResidual: %.0f N, %.0f N·m",
+				r.support(), norm(r.groundForce()), norm(r.groundForce()) / weight, norm(r.residualForce()),
+				norm(r.residualMoment())));
+		effortLabel.setText(sb.toString());
+	}
+
+	private static String number(double v) {
+		return Double.isNaN(v) ? "" : String.format("%.0f", v);
+	}
+
+	private static double norm(double[] v) {
+		return Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+	}
+
+	/** Cinemática directa con la postura actual y la pelvis en ese origen. */
+	private Map<Segment, Matrix4> framesAt(double[] pelvis) {
+		return ForwardKinematics3D.frames(ForwardKinematics3D.computePositions(root, pelvis[0], pelvis[1], pelvis[2]));
+	}
+
+	/** Quita el mapa de esfuerzo: colores normales. */
+	private void clearEffort() {
+		for (PointCloud c : clouds)
+			c.resetColor();
+		for (Sphere s : jointSpheres.values())
+			s.setMaterial(jointMat);
+		effortLabel.setText("");
+		colored = false;
+	}
+
+	/**
+	 * Color según el esfuerzo (0 a 1): cian (el del holograma) -> amarillo ->
+	 * rojo. Color.interpolate mezcla dos colores: 0 = el primero, 1 = el
+	 * segundo.
+	 */
+	private static Color effortColor(double e) {
+		Color yellow = Color.web("#ffd23f"), red = Color.web("#ff2a1f");
+		return e < 0.5 ? HOLO.interpolate(yellow, e / 0.5) : yellow.interpolate(red, (e - 0.5) / 0.5);
+	}
+
+	/**
+	 * Crea las paletas una sola vez: PALETTE_SIZE materiales para los puntos
+	 * (autoiluminados, como el holograma), para las chispas (más claros) y
+	 * para las esferas del esqueleto (normales, con luz).
+	 */
+	private void buildPalettes() {
+		cloudPalette = new PhongMaterial[PALETTE_SIZE];
+		sparkPalette = new PhongMaterial[PALETTE_SIZE];
+		jointPalette = new PhongMaterial[PALETTE_SIZE];
+		for (int i = 0; i < PALETTE_SIZE; i++) {
+			Color c = effortColor((double) i / (PALETTE_SIZE - 1));
+			cloudPalette[i] = glowing(c);
+			sparkPalette[i] = glowing(c.interpolate(Color.WHITE, 0.55));
+			jointPalette[i] = new PhongMaterial(c);
+		}
+	}
+
+	/** Borra los picos de la tabla (empiezan a contar otra vez). */
+	private void resetPeaks() {
+		peaks.clear();
 	}
 
 	/**
@@ -547,11 +731,13 @@ public class HologramApp extends Application {
 	 * una esfera en cada articulación (los nodos) y un cilindro por segmento.
 	 */
 	private void buildSkeletonView() {
-		PhongMaterial jointMat = new PhongMaterial(Color.web("#e8553f"));
+		jointMat = new PhongMaterial(Color.web("#e8553f"));
+		buildPalettes();
 		PhongMaterial boneMat = new PhongMaterial(Color.web("#f2c14e"));
 		for (Segment s : segments) {
 			Sphere joint = new Sphere(2.4);
 			joint.setMaterial(jointMat);
+			jointSpheres.put(s, joint);
 			Affine ja = new Affine();
 			joint.getTransforms().add(ja);
 			jointTransforms.put(s, ja);
@@ -666,6 +852,7 @@ public class HologramApp extends Application {
 			walkButton.setSelected(false);
 			playButton.setSelected(false);
 			origin = skeleton.getOrigin();
+			resetPeaks();
 			// Referencia a método: equivale a s -> s.resetAngles()
 			segments.forEach(Segment::resetAngles);
 			refreshSliders();
@@ -730,13 +917,30 @@ public class HologramApp extends Application {
 				buildCloud((int) pointSlider.getValue());
 		});
 
+		// Mapa de esfuerzo
+		Label massLabel = new Label();
+		massLabel.textProperty().bind(massSlider.valueProperty().asString("Masa corporal: %.0f kg"));
+		massSlider.valueProperty().addListener((obs, old, val) -> {
+			resetPeaks();
+			dirty = true;
+		});
+		effortBox.selectedProperty().addListener((obs, old, on) -> {
+			resetPeaks();
+			dirty = true;
+		});
+		// Letra de ancho fijo para que las columnas de la tabla salgan alineadas
+		effortLabel.setFont(Font.font("Consolas", 12));
+		Label legend = new Label("cian = poco, amarillo = medio,\nrojo = cerca del par máximo");
+		legend.setStyle("-fx-font-size: 11; -fx-text-fill: #666;");
+
 		box.getChildren().addAll(new Separator(), reset, walkButton, new Separator(),
 				new Label("Captura de movimiento"), load, playButton, animLabel, speedLabel, speedSlider,
 				new Separator(),
 				showCloud, showSkeleton, new Separator(),
+				effortBox, legend, massLabel, massSlider, effortLabel, new Separator(),
 				new Label("Puntos del holograma"), pointSlider, cloudLabel, new Separator(), statsLabel);
 		box.setPadding(new Insets(14));
-		box.setPrefWidth(270);
+		box.setPrefWidth(290);
 
 		selector.getSelectionModel().select(byName.get("Brazo D"));
 		refreshSliders();
@@ -777,7 +981,8 @@ public class HologramApp extends Application {
 	/**
 	 * Modo captura, para generar imágenes sin tocar el ratón:
 	 * --snapshot=fichero.png [--walk=segundos] [--yaw=grados]
-	 * [--show=cloud,skeleton] [--points=n] [--bvh=fichero --bvhtime=segundos].
+	 * [--show=cloud,skeleton] [--points=n] [--bvh=fichero --bvhtime=segundos]
+	 * [--effort=1].
 	 * Espera 2 s a que se dibuje la escena, la guarda en PNG y cierra.
 	 */
 	private void takeSnapshotAndExit(Scene scene, String file) {
@@ -789,6 +994,10 @@ public class HologramApp extends Application {
 		}
 		if (args.containsKey("bvhtime") && mocap != null) {
 			animTime = Double.parseDouble(args.get("bvhtime"));
+			// Pulsado pero sin avanzar (velocidad 0): así el mapa de esfuerzo usa la
+			// dinámica de la animación y no el caso estático
+			speedSlider.setValue(0);
+			playButton.setSelected(true);
 			applyAnimation();
 			refreshSliders();
 			dirty = true;
