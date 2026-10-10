@@ -188,6 +188,8 @@ public class HologramApp extends Application {
 	private static final double DYNAMICS_STEP = 0.08; // paso de las diferencias finitas (s), ver showEffort
 	private PhongMaterial[] cloudPalette, sparkPalette, jointPalette;
 	private PhongMaterial jointMat; // color normal de las esferas
+	private static final double JOINT_RADIUS = 2.4; // radio de las esferas de las articulaciones (cm)
+	private PhongMaterial limitMat; // esferas de las articulaciones que han llegado a su límite
 	private final Map<Segment, Sphere> jointSpheres = new IdentityHashMap<>();
 	private boolean colored; // si ahora mismo se ve el mapa de esfuerzo
 
@@ -529,11 +531,44 @@ public class HologramApp extends Application {
 		if (exoBox.isSelected())
 			showExo(frames, result);
 		long t4 = System.nanoTime();
+		String limits = showLimits();
 
 		String retarget = playButton.isSelected() ? String.format("Retargeting .bvh: %.1f µs%n", retargetNanos / 1e3) : "";
 		String dyn = needDynamics ? String.format("Dinámica inversa: %.1f µs%n", (t4 - t3) / 1e3) : "";
-		statsLabel.setText(String.format("%sCinemática directa: %.1f µs%nSkinning: %.2f ms%n%sFPS: %.0f", retarget,
-				(t1 - t0) / 1e3, (t2 - t1) / 1e6, dyn, fps));
+		statsLabel.setText(String.format("%sCinemática directa: %.1f µs%nSkinning: %.2f ms%n%sFPS: %.0f%s", retarget,
+				(t1 - t0) / 1e3, (t2 - t1) / 1e6, dyn, fps, limits));
+	}
+
+	/**
+	 * Pinta en rojo (y más grandes) las esferas de las articulaciones que se
+	 * han quedado en su límite anatómico: la animación o la webcam pedían más
+	 * ángulo del que deja la articulación y Segment.setAngle lo ha recortado.
+	 * Con los sliders no pasa nunca, porque su rango ya son los límites.
+	 * Va después del mapa de esfuerzo para que el rojo se vea por encima.
+	 *
+	 * @return Texto para las estadísticas con las articulaciones en el
+	 *         límite (vacío si no hay ninguna).
+	 */
+	private String showLimits() {
+		StringBuilder sb = new StringBuilder();
+		for (Segment s : segments) {
+			Sphere sphere = jointSpheres.get(s);
+			String axis = s.limitAxis();
+			if (axis != null) {
+				sphere.setMaterial(limitMat);
+				// Más grande cambiando el radio: setScale no sirve aquí porque
+				// JavaFX lo aplica después del Affine y también alejaría la
+				// esfera de su sitio (escalaría su posición)
+				sphere.setRadius(JOINT_RADIUS * 1.6);
+				sb.append(String.format("%n  %s (%s)", s.getName(), axis.toLowerCase()));
+			} else {
+				// Si hay mapa de esfuerzo, showEffort ya le ha puesto su color
+				if (!colored)
+					sphere.setMaterial(jointMat);
+				sphere.setRadius(JOINT_RADIUS);
+			}
+		}
+		return sb.length() == 0 ? "" : "\nEn el límite:" + sb;
 	}
 
 	// ================================================================ esfuerzo
@@ -984,10 +1019,11 @@ public class HologramApp extends Application {
 	 */
 	private void buildSkeletonView() {
 		jointMat = new PhongMaterial(Color.web("#e8553f"));
+		limitMat = glowing(Color.web("#ff1010")); // autoiluminado: se distingue del naranja normal
 		buildPalettes();
 		PhongMaterial boneMat = new PhongMaterial(Color.web("#f2c14e"));
 		for (Segment s : segments) {
-			Sphere joint = new Sphere(2.4);
+			Sphere joint = new Sphere(JOINT_RADIUS);
 			joint.setMaterial(jointMat);
 			jointSpheres.put(s, joint);
 			Affine ja = new Affine();

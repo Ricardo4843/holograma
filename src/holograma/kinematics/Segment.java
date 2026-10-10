@@ -47,6 +47,11 @@ public class Segment {
 	private final double[] min = new double[3]; // límite inferior de cada eje
 	private final double[] max = new double[3]; // límite superior de cada eje
 	private final String[] axisNames = new String[3]; // "Flexión", "Abducción"...
+	// Si el último setAngle de cada eje tuvo que recortarse: el movimiento pedía
+	// más de lo que deja la articulación (la interfaz pinta la esfera en rojo)
+	private final boolean[] clamped = new boolean[3];
+	// Margen para no marcar como recortado un redondeo: 1º en radianes
+	private static final double CLAMP_TOLERANCE = Math.toRadians(1);
 
 	// ---- Estructura del árbol ----
 	private final List<Segment> children = new ArrayList<>();
@@ -135,9 +140,26 @@ public class Segment {
 	 * Cambia el ángulo de un eje, recortándolo a sus límites ("clamp"):
 	 * Math.min(max, x) impide pasarse por arriba y Math.max(min, ...) por abajo.
 	 * Así, por mucho que se le pida, la rodilla nunca se dobla hacia delante.
+	 *
+	 * Además apunta si ha hecho falta recortar: si el ángulo pedido y el que
+	 * se queda se diferencian en más de CLAMP_TOLERANCE, el eje ha llegado a
+	 * su límite.
 	 */
 	public void setAngle(int axis, double angle) {
 		angles[axis] = Math.max(min[axis], Math.min(max[axis], angle));
+		clamped[axis] = Math.abs(angle - angles[axis]) > CLAMP_TOLERANCE;
+	}
+
+	/**
+	 * Nombre del primer eje que se ha quedado en su límite en el último
+	 * setAngle, o null si ninguno. Los ejes bloqueados (min = max) no cuentan:
+	 * ahí el recorte es justo lo que se quiere (la rodilla no gira de lado).
+	 */
+	public String limitAxis() {
+		for (int i = 0; i < 3; i++)
+			if (clamped[i] && isAxisFree(i))
+				return axisNames[i];
+		return null;
 	}
 
 	/** Ángulo actual de un eje, en radianes. */
