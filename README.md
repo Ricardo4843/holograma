@@ -12,6 +12,10 @@ Etapa 3 de la ampliación del lab2 de ALED (Recursividad: cinemática directa de
 |---|---|---|
 | ![esfuerzo](docs/holograma-esfuerzo.png) | ![exo](docs/holograma-exo.png) | ![webcam](docs/holograma-webcam.png) |
 
+| Armadura a medida del cuerpo |
+|---|
+| ![armadura](docs/holograma-armadura.png) |
+
 ## Las tres etapas
 
 | Etapa | Repo | Qué es |
@@ -37,6 +41,7 @@ Controles:
 - **Articulaciones en el límite:** si la animación o la webcam piden más ángulo del que permite una articulación (sus límites anatómicos), `Segment.setAngle` lo recorta y la esfera de esa articulación se pone roja y más grande. En las estadísticas sale cuáles son y en qué eje (por ejemplo, "Mano D (desviación)"). Con los sliders no pasa, porque su rango ya son los límites.
 - **Mapa de esfuerzo:** calcula el par de cada articulación (dinámica inversa) y colorea el holograma de cian a amarillo a rojo según lo cerca que esté de su par máximo. En el panel sale una tabla con los N·m de cada articulación (derecha, izquierda y el pico desde que se empezó), la fuerza del suelo y la fuerza residual. La masa corporal se cambia con un slider.
 - **Exoesqueleto virtual:** motores en cadera, rodilla y/o tobillo que dan un porcentaje del par (con un par máximo y una masa por motor). Se dibujan por fuera de las piernas, en naranja cuando empujan y en verde cuando frenan. Su tabla da, por motor, el par y la potencia, los picos y las rpm, y debajo la masa del exo, la potencia media, la batería para 1 hora y cuánto par le quita a la persona.
+- **Armadura:** placas rojas y doradas sacadas de la propia piel del cuerpo, con máscara, ojos y reactor en el pecho. Va con todo: caminar, `.bvh`, webcam, mapa de esfuerzo y exo. En las articulaciones quedan huecos por los que se ve el holograma.
 - Hay un slider para el número de puntos (de 10.000 a 300.000).
 
 ## Cómo funciona
@@ -72,6 +77,13 @@ Controles:
    - Para la dinámica en directo no se conoce el futuro: se guarda una **cola** con las posturas del último segundo y se calcula para la de hace 0,08 s, con la anterior y la última.
    - Con una sola cámara, la profundidad tiene errores de varios centímetros, así que en directo un pie cuenta como apoyado hasta a 10 cm del suelo (3 cm con las animaciones).
 
+10. **La armadura.** `Armor` construye una placa por segmento a partir de la malla del cuerpo:
+   - Un triángulo entra en la placa de un segmento si sus tres vértices lo siguen con un peso de al menos 0,8 (0,5 en el tronco y los hombros, donde los pesos se mezclan en zonas muy anchas). Los triángulos de las zonas de mezcla se quedan fuera, y por eso hay huecos en codos, rodillas y cintura, como en una armadura de verdad: una placa encima de la piel que se dobla se clavaría.
+   - La placa es la piel empujada 1,4 cm hacia fuera por la **normal de cada vértice** (la suma de los productos vectoriales de sus triángulos, que ya pesa cada uno por su área). El sentido hacia fuera se comprueba solo: si de media las normales apuntan al centro del cuerpo, se les da la vuelta.
+   - Para que tenga grosor, en cada borde hay un canto que baja hasta 0,4 cm de la piel. Un borde es una arista que solo usa un triángulo de la placa, y se cuentan con un mapa cuya clave es la arista (sus dos vértices, el menor primero, en un `long`).
+   - Cada placa sigue al 100% a un segmento, así que se mueve de forma rígida con su matriz de skinning: una sola `Affine` por segmento y ningún vértice que mover en cada fotograma.
+   - La máscara dorada son los triángulos de la cabeza que miran hacia delante y están por debajo de la frente. Los ojos se colocan delante de las mallas de los ojos de MakeHuman, y el reactor en el vértice más adelantado del esternón.
+
 ### Rendimiento: de 5 a 60 FPS
 
 La primera versión recalculaba en Java cada punto en cada fotograma. Calcularlos costaba unos 4 ms, pero JavaFX tarda mucho en reprocesar una malla que cambia, y con 65.000 puntos iba a **5 FPS**.
@@ -92,8 +104,8 @@ Resultado medido caminando (`--fpstest=8`):
 - `src/holograma/dynamics/`: `InverseDynamics` (pares articulares por Newton-Euler recursivo, fuerza del suelo y polígono de apoyo), `Exoskeleton` (controlador, masas y estadísticas de los motores)
 - `src/holograma/mocap/`: `BvhMotion` (lector de `.bvh` y su cinemática directa), `Retargeter` (pasa el movimiento del esqueleto del `.bvh` al nuestro), `LiveReceiver` y `LiveRetargeter` (en directo desde MediaPipe)
 - `webcam/`: `pose_sender.py` (MediaPipe → UDP), `run.ps1` (crea el entorno y lo lanza) y `requirements.txt`
-- `src/holograma/body/`: `ObjMesh` (lector de .obj), `JsonParser` (JSON por descenso recursivo), `MakeHumanRig` (pesos y articulaciones), `PointCloud` (holograma)
-- `src/holograma/gui/HologramApp.java`: visor JavaFX (y `ExoView`, el dibujo del exo). Tiene también un modo captura (`--snapshot=f.png [--walk=s] [--yaw=grados] [--show=cloud,skeleton] [--points=n] [--bvh=f.bvh --bvhtime=s] [--effort=1] [--exo=1 [--ankle=1]] [--live=1]`) y una prueba de rendimiento (`--fpstest=segundos [--nowalk=1] [--bvh=f.bvh]`).
+- `src/holograma/body/`: `ObjMesh` (lector de .obj), `JsonParser` (JSON por descenso recursivo), `MakeHumanRig` (pesos y articulaciones), `PointCloud` (holograma), `Armor` (armadura)
+- `src/holograma/gui/HologramApp.java`: visor JavaFX (y `ExoView`, el dibujo del exo). Tiene también un modo captura (`--snapshot=f.png [--walk=s] [--yaw=grados] [--show=cloud,skeleton] [--points=n] [--bvh=f.bvh --bvhtime=s] [--effort=1] [--exo=1 [--ankle=1]] [--armor=1] [--live=1]`) y una prueba de rendimiento (`--fpstest=segundos [--nowalk=1] [--bvh=f.bvh]`).
 - `modelo/`: el cuerpo exportado de MakeHuman (`cuerpo.obj`) y los pesos de la malla base (`default_weights.mhw`, CC0, de MakeHuman 1.3.0)
 - `animaciones/`: capturas de movimiento de la base de datos de CMU (caminar, correr, saltar, bailar, artes marciales)
 - `lib/`: JavaFX 23.0.2 (jars para Windows de Maven Central)
@@ -101,6 +113,8 @@ Resultado medido caminando (`--fpstest=8`):
 Para usar otro cuerpo: en MakeHuman, exportar como Wavefront obj en centímetros, sin ropa ni pelo, y guardarlo como `modelo/cuerpo.obj`.
 
 ## Ideas para seguir
+
+- Armadura: animación de "suit-up" (las placas llegan volando y se montan sobre el cuerpo), meter los motores del exo dentro de la armadura y realidad aumentada (dibujarla encima del vídeo de la webcam, en el lado de Python).
 
 - Cinemática inversa: dar la posición de la mano o del pie y calcular los ángulos (CCD o jacobiano).
 - Controladores de exo más realistas: por fases de la marcha, o con el par limitado por la curva par-velocidad de un motor real.

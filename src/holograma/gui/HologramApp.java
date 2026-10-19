@@ -17,6 +17,7 @@ import java.util.Random;
 
 import javax.imageio.ImageIO;
 
+import holograma.body.Armor;
 import holograma.body.MakeHumanRig;
 import holograma.body.PointCloud;
 import holograma.dynamics.Exoskeleton;
@@ -154,6 +155,9 @@ public class HologramApp extends Application {
 	private final Group skeletonGroup = new Group(); // esferas (nodos) y cilindros (segmentos)
 	private final Group decorGroup = new Group(); // partículas y números del fondo
 	private final List<PointCloud> clouds = new ArrayList<>();
+	private final Group armorGroup = new Group(); // armadura (placas sobre el cuerpo)
+	private Armor armor; // null si no hay modelo de MakeHuman
+	private final CheckBox armorBox = new CheckBox("Armadura (placas sobre el cuerpo)");
 	// Affine = transformación general de JavaFX (una matriz 3x4 como Matrix4).
 	// Se guarda una por esfera y cilindro, y cada fotograma se le copia el frame
 	// calculado por la cinemática.
@@ -267,7 +271,7 @@ public class HologramApp extends Application {
 		int pointCount = Integer.parseInt(args.getOrDefault("points", "60000"));
 
 		// Grupo "mundo": aquí van las coordenadas de la cinemática.
-		Group world = new Group(cloudGroup, skeletonGroup, exoView.getNode());
+		Group world = new Group(cloudGroup, armorGroup, skeletonGroup, exoView.getNode());
 		// La cinemática usa Z hacia arriba (convenio de robótica), pero JavaFX usa
 		// Y hacia ABAJO (convenio de pantallas: el píxel (0,0) está arriba a la
 		// izquierda). Un giro de 90º sobre X convierte uno en otro:
@@ -276,6 +280,7 @@ public class HologramApp extends Application {
 		world.getTransforms().add(new Rotate(90, Rotate.X_AXIS));
 		buildSkeletonView();
 		buildCloud(pointCount);
+		buildArmor();
 		buildDecor();
 
 		// Suelo: una caja muy fina en y = 0 (solo cuando no se ve el holograma)
@@ -349,6 +354,9 @@ public class HologramApp extends Application {
 			exoBox.setSelected(true);
 		if (args.containsKey("ankle"))
 			ankleBox.setSelected(true);
+		// --armor=1: arranca con la armadura puesta
+		if (args.containsKey("armor"))
+			armorBox.setSelected(true);
 		// --live=1: arranca en directo SIN lanzar la webcam (para pruebas en las
 		// que los datos los manda otro programa, por ejemplo pose_sender.py --image)
 		if (args.containsKey("live")) {
@@ -496,14 +504,18 @@ public class HologramApp extends Application {
 		Map<Segment, double[]> skin = new IdentityHashMap<>();
 		for (Segment s : segments)
 			skin.put(s, frames.get(s).multiply(restInverse.get(s)).toArray());
-		// 3) Mover los puntos del holograma (si se está viendo). La nube usa un array en el orden de
-		//    MakeHumanRig.SEGMENTS, más rápido de consultar que un mapa.
-		if (cloudGroup.isVisible() && rig != null) {
+		// 3) Mover los puntos del holograma y la armadura (lo que se esté viendo).
+		//    Usan un array en el orden de MakeHumanRig.SEGMENTS, más rápido de
+		//    consultar que un mapa.
+		if ((cloudGroup.isVisible() || armorGroup.isVisible()) && rig != null) {
 			double[][] skinArray = new double[MakeHumanRig.SEGMENTS.length][];
 			for (int i = 0; i < skinArray.length; i++)
 				skinArray[i] = skin.get(byName.get(MakeHumanRig.SEGMENTS[i]));
-			for (PointCloud c : clouds)
-				c.update(skinArray);
+			if (cloudGroup.isVisible())
+				for (PointCloud c : clouds)
+					c.update(skinArray);
+			if (armorGroup.isVisible())
+				armor.update(skinArray);
 		}
 		long t2 = System.nanoTime();
 
@@ -967,6 +979,18 @@ public class HologramApp extends Application {
 	}
 
 	/**
+	 * Crea la armadura (ver Armor). Se hace una sola vez: no depende del
+	 * número de puntos.
+	 */
+	private void buildArmor() {
+		armorGroup.setVisible(false);
+		if (rig == null)
+			return;
+		armor = new Armor(rig);
+		armorGroup.getChildren().add(armor.getNode());
+	}
+
+	/**
 	 * Material que BRILLA POR SÍ MISMO: color difuso negro (no le afecta la
 	 * iluminación) más un "mapa de autoiluminación" de un solo píxel del color
 	 * deseado. Así el punto se ve siempre de ese color, como una luz.
@@ -1060,6 +1084,7 @@ public class HologramApp extends Application {
 		boolean holo = showCloud.isSelected() && rig != null;
 		cloudGroup.setVisible(showCloud.isSelected());
 		skeletonGroup.setVisible(showSkeleton.isSelected());
+		armorGroup.setVisible(armorBox.isSelected() && armor != null);
 		decorGroup.setVisible(holo);
 		floor.setVisible(!holo);
 		// El fondo se pinta en el Pane que hay DETRÁS de la SubScene (que se deja
@@ -1212,8 +1237,9 @@ public class HologramApp extends Application {
 		showCloud.setSelected(rig != null);
 		showSkeleton.setSelected(rig == null);
 		showCloud.setDisable(rig == null);
-		for (CheckBox c : new CheckBox[] { showCloud, showSkeleton })
+		for (CheckBox c : new CheckBox[] { showCloud, showSkeleton, armorBox })
 			c.selectedProperty().addListener((obs, old, on) -> updateLook());
+		armorBox.setDisable(rig == null);
 
 		// Slider de puntos del holograma: de 10.000 a 300.000
 		Slider pointSlider = new Slider(10_000, 300_000, clouds.isEmpty() ? 60_000 : clouds.get(0).getCount());
@@ -1267,7 +1293,7 @@ public class HologramApp extends Application {
 		box.getChildren().addAll(new Separator(), reset, walkButton, new Separator(),
 				new Label("Captura de movimiento"), load, playButton, animLabel, speedLabel, speedSlider,
 				new Separator(), liveButton, mirrorBox, liveLabel, new Separator(),
-				showCloud, showSkeleton, new Separator(),
+				showCloud, showSkeleton, armorBox, new Separator(),
 				effortBox, legend, massLabel, massSlider, effortLabel, new Separator(),
 				exoBox, exoLegend, motors, assistLabel, assistSlider, torqueLabel, motorTorqueSlider, motorMassLabel,
 				motorMassSlider, exoLabel, new Separator(),
@@ -1316,7 +1342,7 @@ public class HologramApp extends Application {
 	 * Modo captura, para generar imágenes sin tocar el ratón:
 	 * --snapshot=fichero.png [--walk=segundos] [--yaw=grados]
 	 * [--show=cloud,skeleton] [--points=n] [--bvh=fichero --bvhtime=segundos]
-	 * [--effort=1] [--exo=1 [--ankle=1]] [--live=1].
+	 * [--effort=1] [--exo=1 [--ankle=1]] [--armor=1] [--live=1].
 	 * Espera 2 s a que se dibuje la escena, la guarda en PNG y cierra.
 	 */
 	private void takeSnapshotAndExit(Scene scene, String file) {
